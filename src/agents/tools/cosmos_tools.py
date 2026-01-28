@@ -1,0 +1,680 @@
+"""
+Cosmos DB Tools for storing email classification results and extracted data.
+Uses DefaultAzureCredential for passwordless authentication.
+"""
+
+import os
+import json
+import hashlib
+import logging
+from typing import Optional, List, Tuple
+from datetime import datetime
+from azure.identity import DefaultAzureCredential
+from azure.cosmos import CosmosClient, PartitionKey
+from azure.cosmos.aio import CosmosClient as AsyncCosmosClient
+
+logger = logging.getLogger(__name__)
+
+
+class CosmosDBTools:
+    """Tools for interacting with Azure Cosmos DB."""
+    
+    # Container names
+    CONTAINER_EMAILS = "emails"
+    CONTAINER_PE_EVENTS = "pe-events"
+    CONTAINER_CLASSIFICATIONS = "classifications"
+    CONTAINER_AUDIT_LOGS = "audit-logs"
+    CONTAINER_EXTRACTED_DATA = "extracted-data"
+    
+    def __init__(
+        self,
+        endpoint: Optional[str] = None,
+        database_name: Optional[str] = None
+    ):
+        """
+        Initialize the Cosmos DB client.
+        
+        Args:
+            endpoint: Cosmos DB endpoint URL
+            database_name: Name of the database
+        """
+        self.endpoint = endpoint or os.environ.get("COSMOS_ENDPOINT")
+        self.database_name = database_name or os.environ.get("COSMOS_DATABASE", "email-processing")
+        
+        if not self.endpoint:
+            raise ValueError(
+                "Cosmos DB endpoint is required. "
+                "Set COSMOS_ENDPOINT environment variable."
+            )
+        
+        self.credential = DefaultAzureCredential()
+    
+    def _get_sync_client(self) -> CosmosClient:
+        """Get synchronous Cosmos DB client."""
+        return CosmosClient(
+            url=self.endpoint,
+            credential=self.credential
+        )
+    
+    def _get_async_client(self) -> AsyncCosmosClient:
+        """Get asynchronous Cosmos DB client."""
+        from azure.identity.aio import DefaultAzureCredential as AsyncCredential
+        return AsyncCosmosClient(
+            url=self.endpoint,
+            credential=AsyncCredential()
+        )
+    
+    def update_email_classification(
+        self,
+        email_id: str,
+        classification: str,
+        confidence_score: float,
+        classification_details: dict,
+        step: str = "final",
+        email_data: dict = None
+    ) -> dict:
+        """
+        Update an email document with classification results.
+        Creates a new document if one doesn't exist (for direct queue testing).
+        
+        Args:
+            email_id: The unique email ID
+            classification: Category assigned
+            confidence_score: Confidence level (0.0 to 1.0)
+            classification_details: Additional metadata
+            step: Classification step ("relevance" or "final")
+            email_data: Original email data (used to create document if not found)
+            
+        Returns:
+            Updated document
+        """
+        logger.info(f"Updating classification for email {email_id[:20]}...")
+        
+        with self._get_sync_client() as client:
+            database = client.get_database_client(self.database_name)
+            container = database.get_container_client(self.CONTAINER_EMAILS)
+            
+            # Try to find the email document by id or emailId
+            # The Logic App creates documents with id=emailId, so we check both
+            query = "SELECT * FROM c WHERE c.id = @emailId OR c.emailId = @emailId"
+            items = list(container.query_items(
+                query=query,
+                parameters=[{"name": "@emailId", "value": email_id}],
+                enable_cross_partition_query=True
+            ))
+            
+            # Debug: Log all found documents
+            logger.debug(f"Query found {len(items)} document(s) for email {email_id[:20]}...")
+            for item in items:
+                logger.debug(f"  - status={item.get('status')}, id={item.get('id')[:20]}...")
+            
+            if not items:
+                # Document not found - create a new one from email_data if available
+                old_status = None  # No existing document
+                if email_data:
+                    logger.info(f"Creating new email document for {email_id[:20]}...")
+                    doc = {
+                        "id": email_id,
+                        "emailId": email_id,
+                        "from": email_data.get("from", email_data.get("sender", "unknown")),
+                        "subject": email_data.get("subject", ""),
+                        "emailBody": email_data.get("emailBody", email_data.get("bodyText", email_data.get("body", ""))),
+                        "receivedAt": email_data.get("receivedAt", email_data.get("received_at", datetime.utcnow().isoformat())),
+                        "hasAttachments": email_data.get("hasAttachments", email_data.get("has_attachments", False)),
+                        "status": "received",  # Always start with received status (partition key)
+                        "createdAt": datetime.utcnow().isoformat()
+                    }
+                else:
+                    logger.warning(f"Email document not found for {email_id[:20]}... and no email_data provided. Cannot update.")
+                    return None
+            else:
+                doc = items[0]
+                # Capture old_status BEFORE any modifications (since doc and items[0] are same reference)
+                old_status = doc.get("status")
+                # Ensure doc has required fields from email_data if missing
+                if email_data:
+                    if not doc.get("from"):
+                        doc["from"] = email_data.get("from", email_data.get("sender", "unknown"))
+                    if not doc.get("subject"):
+                        doc["subject"] = email_data.get("subject", "")
+                    if not doc.get("emailBody"):
+                        doc["emailBody"] = email_data.get("emailBody", email_data.get("bodyText", ""))
+                    if not doc.get("receivedAt"):
+                        doc["receivedAt"] = email_data.get("receivedAt", datetime.utcnow().isoformat())
+                    if not doc.get("status"):
+                        doc["status"] = "received"
+            
+            # Update classification fields
+            if step == "relevance":
+                doc["relevanceCheck"] = {
+                    "isRelevant": classification != "Others",
+                    "initialCategory": classification,
+                    "confidence": confidence_score,
+                    "reasoning": classification_details.get("reasoning", ""),
+                    "checkedAt": datetime.utcnow().isoformat()
+                }
+            else:
+                # Embedded classification with fund_name and pe_company
+                doc["classification"] = {
+                    "category": classification,
+                    "confidence": confidence_score,
+                    "fund_name": classification_details.get("fund_name", "Unknown"),
+                    "pe_company": classification_details.get("pe_company", "Unknown"),
+                    "reasoning": classification_details.get("reasoning", ""),
+                    "key_evidence": classification_details.get("key_evidence", []),
+                    "amount": classification_details.get("amount"),
+                    "due_date": classification_details.get("due_date"),
+                    "detected_language": classification_details.get("detected_language", "English"),
+                    "classifiedAt": datetime.utcnow().isoformat()
+                }
+                
+                # Determine status and queue based on 65% confidence threshold
+                if classification == "Not PE Related":
+                    doc["status"] = "discarded"
+                    doc["queue"] = "discarded"
+                elif confidence_score >= 0.65:
+                    doc["status"] = "classified"
+                    doc["queue"] = "archival-pending"
+                else:
+                    doc["status"] = "needs_review"
+                    doc["queue"] = "human-review"
+            
+            doc["updatedAt"] = datetime.utcnow().isoformat()
+            
+            # Since partition key is /status, changing status creates a new document
+            # We need to delete the old one first if status changed
+            # Note: old_status was captured earlier BEFORE modifying doc
+            new_status = doc.get("status")
+            
+            logger.debug(f"Status check: old_status={old_status}, new_status={new_status}, items_count={len(items) if items else 0}")
+            
+            if items and old_status and old_status != new_status:
+                # Delete the old document with the old partition key
+                try:
+                    logger.info(f"Deleting old document {email_id[:20]}... with partition_key={old_status}")
+                    container.delete_item(item=email_id, partition_key=old_status)
+                    logger.info(f"Successfully deleted old document with status={old_status}")
+                except Exception as e:
+                    logger.warning(f"Could not delete old document: {e}")
+            
+            # Upsert the document with new status
+            result = container.upsert_item(doc)
+            logger.info(f"Updated email document: {email_id[:20]}...")
+            
+            return result
+    
+    def store_extracted_content(
+        self,
+        email_id: str,
+        attachment_name: str,
+        extracted_content: dict
+    ) -> dict:
+        """
+        Store extracted content from document intelligence.
+        
+        Args:
+            email_id: The email ID this content belongs to
+            attachment_name: Name of the attachment file
+            extracted_content: The extracted data (text, tables, etc.)
+            
+        Returns:
+            Created document
+        """
+        logger.info(f"Storing extracted content for {attachment_name}...")
+        
+        with self._get_sync_client() as client:
+            database = client.get_database_client(self.database_name)
+            container = database.get_container_client(self.CONTAINER_EXTRACTED_DATA)
+            
+            doc = {
+                "id": f"{email_id}-{attachment_name}",
+                "emailId": email_id,
+                "attachmentName": attachment_name,
+                "extractedAt": datetime.utcnow().isoformat(),
+                "pageCount": extracted_content.get("page_count", 0),
+                "tableCount": extracted_content.get("table_count", 0),
+                "fullText": extracted_content.get("full_text", ""),
+                "tables": extracted_content.get("tables", []),
+                "keyValuePairs": extracted_content.get("key_value_pairs", []),
+                "summary": extracted_content.get("summary", {})
+            }
+            
+            result = container.upsert_item(doc)
+            logger.info(f"Stored extracted content: {doc['id']}")
+            
+            return result
+    
+    def store_table_data(
+        self,
+        email_id: str,
+        attachment_name: str,
+        table_index: int,
+        table_data: dict,
+        classification: str
+    ) -> dict:
+        """
+        Store structured table data for querying.
+        
+        Args:
+            email_id: The email ID
+            attachment_name: Source attachment name
+            table_index: Index of the table in the document
+            table_data: Structured table data
+            classification: Email classification for context
+            
+        Returns:
+            Created document
+        """
+        logger.info(f"Storing table {table_index} from {attachment_name}...")
+        
+        with self._get_sync_client() as client:
+            database = client.get_database_client(self.database_name)
+            container = database.get_container_client(self.CONTAINER_EXTRACTED_DATA)
+            
+            doc = {
+                "id": f"{email_id}-{attachment_name}-table-{table_index}",
+                "type": "table",
+                "emailId": email_id,
+                "attachmentName": attachment_name,
+                "tableIndex": table_index,
+                "classification": classification,
+                "extractedAt": datetime.utcnow().isoformat(),
+                "rowCount": table_data.get("row_count", 0),
+                "columnCount": table_data.get("column_count", 0),
+                "rows": table_data.get("rows", []),
+                "cells": table_data.get("cells", [])
+            }
+            
+            result = container.upsert_item(doc)
+            logger.info(f"Stored table data: {doc['id']}")
+            
+            return result
+    
+    def log_classification_event(
+        self,
+        email_id: str,
+        event_type: str,
+        details: dict
+    ) -> dict:
+        """
+        Log an audit event for classification tracking.
+        
+        Args:
+            email_id: The email being processed
+            event_type: Type of event (e.g., "relevance_check", "classification", "routing")
+            details: Event details
+            
+        Returns:
+            Created log entry
+        """
+        with self._get_sync_client() as client:
+            database = client.get_database_client(self.database_name)
+            container = database.get_container_client(self.CONTAINER_AUDIT_LOGS)
+            
+            doc = {
+                "id": f"{email_id}-{event_type}-{datetime.utcnow().timestamp()}",
+                "emailId": email_id,
+                "eventType": event_type,
+                "timestamp": datetime.utcnow().isoformat(),
+                "details": details
+            }
+            
+            result = container.upsert_item(doc)
+            return result
+
+    def _generate_dedup_key(
+        self,
+        pe_company: str,
+        fund_name: str,
+        event_type: str,
+        amount: Optional[str] = None,
+        due_date: Optional[str] = None
+    ) -> str:
+        """
+        Generate a deduplication key for PE events.
+        
+        The key is a hash of normalized key fields that uniquely identify an event.
+        
+        Args:
+            pe_company: PE firm name
+            fund_name: Fund name
+            event_type: Type of event (Capital Call, Distribution, etc.)
+            amount: Transaction amount (optional)
+            due_date: Due date (optional)
+            
+        Returns:
+            SHA256 hash string (first 16 chars)
+        """
+        # Normalize fields for consistent matching
+        def normalize(s: str) -> str:
+            if not s:
+                return ""
+            # Lowercase, remove extra spaces, remove common suffixes
+            s = s.lower().strip()
+            s = " ".join(s.split())  # Normalize whitespace
+            # Remove common variations
+            for suffix in [" llc", " lp", " inc", " corp", " ltd", " partners", " fund"]:
+                if s.endswith(suffix):
+                    s = s[:-len(suffix)].strip()
+            return s
+        
+        # Extract month from due_date for fuzzy matching (same month = same event)
+        date_key = ""
+        if due_date:
+            try:
+                # Handle various date formats
+                if "T" in due_date:
+                    date_key = due_date[:7]  # YYYY-MM
+                elif "-" in due_date:
+                    parts = due_date.split("-")
+                    if len(parts) >= 2:
+                        date_key = f"{parts[0]}-{parts[1]}"
+            except:
+                date_key = ""
+        
+        # Normalize amount (remove currency symbols, commas)
+        amount_key = ""
+        if amount:
+            amount_key = "".join(c for c in str(amount) if c.isdigit() or c == ".")
+        
+        # Build the composite key
+        key_parts = [
+            normalize(pe_company),
+            normalize(fund_name),
+            normalize(event_type),
+            amount_key,
+            date_key
+        ]
+        
+        key_string = "|".join(key_parts)
+        hash_value = hashlib.sha256(key_string.encode()).hexdigest()[:16]
+        
+        logger.debug(f"Generated dedup key: {key_string} -> {hash_value}")
+        return hash_value
+
+    def find_or_create_pe_event(
+        self,
+        email_id: str,
+        classification_details: dict
+    ) -> Tuple[dict, bool]:
+        """
+        Find an existing PE event or create a new one.
+        Links the email to the event.
+        
+        Args:
+            email_id: The email ID to link
+            classification_details: Classification result with pe_company, fund_name, etc.
+            
+        Returns:
+            Tuple of (pe_event document, is_duplicate boolean)
+        """
+        pe_company = classification_details.get("pe_company", "Unknown")
+        fund_name = classification_details.get("fund_name", "Unknown")
+        event_type = classification_details.get("category", "Unknown")
+        amount = classification_details.get("amount")
+        due_date = classification_details.get("due_date")
+        
+        # Generate dedup key
+        dedup_key = self._generate_dedup_key(
+            pe_company=pe_company,
+            fund_name=fund_name,
+            event_type=event_type,
+            amount=amount,
+            due_date=due_date
+        )
+        
+        logger.info(f"Looking for PE event with dedup key: {dedup_key}")
+        
+        with self._get_sync_client() as client:
+            database = client.get_database_client(self.database_name)
+            container = database.get_container_client(self.CONTAINER_PE_EVENTS)
+            
+            # Try to find existing event by dedup key
+            query = "SELECT * FROM c WHERE c.dedupKey = @dedupKey"
+            items = list(container.query_items(
+                query=query,
+                parameters=[{"name": "@dedupKey", "value": dedup_key}],
+                enable_cross_partition_query=True
+            ))
+            
+            if items:
+                # Found existing event - add email to list
+                event = items[0]
+                is_duplicate = True
+                
+                # Add email to the linked emails list if not already there
+                if "emailIds" not in event:
+                    event["emailIds"] = []
+                
+                if email_id not in event["emailIds"]:
+                    event["emailIds"].append(email_id)
+                    event["emailCount"] = len(event["emailIds"])
+                    event["lastEmailAt"] = datetime.utcnow().isoformat()
+                    event["updatedAt"] = datetime.utcnow().isoformat()
+                    
+                    # Update the event
+                    container.upsert_item(event)
+                    logger.info(f"Added email {email_id[:20]}... to existing PE event (total: {event['emailCount']} emails)")
+                else:
+                    logger.info(f"Email {email_id[:20]}... already linked to PE event")
+                
+                return event, is_duplicate
+            else:
+                # Create new event
+                is_duplicate = False
+                event_id = f"pe-{dedup_key}-{int(datetime.utcnow().timestamp())}"
+                
+                event = {
+                    "id": event_id,
+                    "dedupKey": dedup_key,
+                    "eventType": event_type,
+                    "peCompany": pe_company,
+                    "fundName": fund_name,
+                    "amount": amount,
+                    "dueDate": due_date,
+                    "emailIds": [email_id],
+                    "emailCount": 1,
+                    "status": "pending",  # pending, archived, reviewed
+                    "createdAt": datetime.utcnow().isoformat(),
+                    "lastEmailAt": datetime.utcnow().isoformat(),
+                    "reasoning": classification_details.get("reasoning", ""),
+                    "confidence": classification_details.get("confidence", 0.0),
+                    "keyEvidence": classification_details.get("key_evidence", [])
+                }
+                
+                try:
+                    result = container.create_item(event)
+                    logger.info(f"Created new PE event: {event_id}")
+                    return result, is_duplicate
+                except Exception as e:
+                    # Handle race condition - another process might have created it
+                    if "Conflict" in str(e) or "409" in str(e):
+                        logger.info("Race condition detected, fetching existing event")
+                        items = list(container.query_items(
+                            query=query,
+                            parameters=[{"name": "@dedupKey", "value": dedup_key}],
+                            enable_cross_partition_query=True
+                        ))
+                        if items:
+                            return items[0], True
+                    raise
+
+    def mark_email_as_duplicate(
+        self,
+        email_id: str,
+        pe_event_id: str
+    ) -> dict:
+        """
+        Mark an email as a duplicate and link it to the canonical PE event.
+        
+        Args:
+            email_id: The email ID to mark
+            pe_event_id: The PE event this email is a duplicate of
+            
+        Returns:
+            Updated email document
+        """
+        logger.info(f"Marking email {email_id[:20]}... as duplicate of {pe_event_id}")
+        
+        with self._get_sync_client() as client:
+            database = client.get_database_client(self.database_name)
+            container = database.get_container_client(self.CONTAINER_EMAILS)
+            
+            # Find the email document
+            query = "SELECT * FROM c WHERE c.id = @emailId OR c.emailId = @emailId"
+            items = list(container.query_items(
+                query=query,
+                parameters=[{"name": "@emailId", "value": email_id}],
+                enable_cross_partition_query=True
+            ))
+            
+            if items:
+                doc = items[0]
+                doc["isDuplicate"] = True
+                doc["peEventId"] = pe_event_id
+                doc["updatedAt"] = datetime.utcnow().isoformat()
+                
+                result = container.upsert_item(doc)
+                logger.info(f"Marked email as duplicate: {email_id[:20]}...")
+                return result
+            else:
+                logger.warning(f"Email not found for duplicate marking: {email_id[:20]}...")
+                return None
+
+    def get_pe_event_stats(self) -> dict:
+        """
+        Get statistics about PE events for dashboard display.
+        
+        Returns:
+            Dictionary with event counts by type, duplicate stats, etc.
+        """
+        with self._get_sync_client() as client:
+            database = client.get_database_client(self.database_name)
+            container = database.get_container_client(self.CONTAINER_PE_EVENTS)
+            
+            # Count by event type
+            query = """
+                SELECT c.eventType, COUNT(1) as count, SUM(c.emailCount) as totalEmails
+                FROM c
+                GROUP BY c.eventType
+            """
+            
+            stats = {
+                "byEventType": {},
+                "totalEvents": 0,
+                "totalEmails": 0,
+                "duplicateEmails": 0
+            }
+            
+            try:
+                for item in container.query_items(
+                    query=query,
+                    enable_cross_partition_query=True
+                ):
+                    event_type = item.get("eventType", "Unknown")
+                    count = item.get("count", 0)
+                    total_emails = item.get("totalEmails", 0)
+                    
+                    stats["byEventType"][event_type] = {
+                        "events": count,
+                        "emails": total_emails
+                    }
+                    stats["totalEvents"] += count
+                    stats["totalEmails"] += total_emails
+                
+                # Duplicate emails = total emails - total events
+                stats["duplicateEmails"] = stats["totalEmails"] - stats["totalEvents"]
+                
+            except Exception as e:
+                logger.warning(f"Error getting PE event stats: {e}")
+            
+            return stats
+
+
+# Tool function definitions for agent framework
+def get_cosmos_tool_definitions() -> list:
+    """
+    Returns the tool definitions for the Azure AI Agent framework.
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "update_email_classification",
+                "description": (
+                    "Updates an email document in Cosmos DB with classification results. "
+                    "Call this after determining the email category and confidence score."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "email_id": {
+                            "type": "string",
+                            "description": "The unique email ID"
+                        },
+                        "classification": {
+                            "type": "string",
+                            "description": "Category assigned to the email",
+                            "enum": [
+                                "Capital calls",
+                                "Distributions",
+                                "Capital account statements",
+                                "Other PE lifecycle events",
+                                "Others"
+                            ]
+                        },
+                        "confidence_score": {
+                            "type": "number",
+                            "description": "Classification confidence score between 0.0 and 1.0"
+                        },
+                        "reasoning": {
+                            "type": "string",
+                            "description": "Explanation for the classification decision"
+                        },
+                        "step": {
+                            "type": "string",
+                            "description": "Classification step: 'relevance' for initial check, 'final' for full classification",
+                            "enum": ["relevance", "final"]
+                        }
+                    },
+                    "required": ["email_id", "classification", "confidence_score", "reasoning", "step"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "store_extracted_content",
+                "description": (
+                    "Stores content extracted from PDF attachments (text, tables, key-value pairs) "
+                    "to Cosmos DB for later querying and analysis."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "email_id": {
+                            "type": "string",
+                            "description": "The email ID this content belongs to"
+                        },
+                        "attachment_name": {
+                            "type": "string",
+                            "description": "Name of the PDF attachment"
+                        },
+                        "page_count": {
+                            "type": "integer",
+                            "description": "Number of pages in the document"
+                        },
+                        "table_count": {
+                            "type": "integer",
+                            "description": "Number of tables found"
+                        },
+                        "text_summary": {
+                            "type": "string",
+                            "description": "First 500 characters of extracted text"
+                        }
+                    },
+                    "required": ["email_id", "attachment_name"]
+                }
+            }
+        }
+    ]

@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Email Processing Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#0078D4',
+                        success: '#107C10',
+                        warning: '#FFB900',
+                        danger: '#D13438',
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        .status-received { background-color: #E5F1FB; color: #0078D4; }
+        .status-processing { background-color: #FFF4CE; color: #8A6914; }
+        .status-completed { background-color: #DFF6DD; color: #107C10; }
+        .status-failed { background-color: #FDE7E9; color: #D13438; }
+        .status-pending { background-color: #F3F2F1; color: #605E5C; }
+        .status-classified { background-color: #DFF6DD; color: #107C10; }
+        .status-discarded { background-color: #F3F2F1; color: #605E5C; }
+        .status-needs_review { background-color: #FFF4CE; color: #8A6914; }
+        .badge-duplicate { background-color: #FCE8E8; color: #C53030; }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <!-- Header -->
+    <header class="bg-primary text-white shadow-lg">
+        <div class="container mx-auto px-6 py-4">
+            <div class="flex items-center justify-between">
+                <div>
+                    <h1 class="text-2xl font-bold">📧 Email Processing Dashboard</h1>
+                    <p class="text-blue-100 text-sm">Quintet PE Document Automation</p>
+                </div>
+                <div class="flex items-center gap-4">
+                    <div class="text-right text-sm">
+                        <label for="profileSelect" class="text-blue-100 text-xs">View as:</label>
+                        <select id="profileSelect" onchange="switchProfile(this.value)" 
+                                class="ml-2 px-3 py-1 rounded bg-white/20 text-white border-none cursor-pointer hover:bg-white/30 transition text-sm">
+                            <option value="admin" class="text-gray-800">👑 Admin</option>
+                            <option value="user" class="text-gray-800">👤 User</option>
+                        </select>
+                    </div>
+                    <div class="text-right text-sm">
+                        <p>Last updated: <span id="lastUpdate">{{ now().strftime('%Y-%m-%d %H:%M:%S') if now is defined else 'N/A' }}</span></p>
+                        <button onclick="location.reload()" class="mt-1 px-3 py-1 bg-white/20 rounded hover:bg-white/30 transition">
+                            🔄 Refresh
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="container mx-auto px-6 py-8">
+        <!-- PE Events Stats Section -->
+        {% if pe_stats %}
+        <section class="mb-8">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">📊 PE Events Summary</h2>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div class="bg-white rounded-lg shadow p-4">
+                    <div class="text-3xl font-bold text-primary">{{ pe_stats.totalEvents }}</div>
+                    <div class="text-sm text-gray-500">Unique Events</div>
+                </div>
+                <div class="bg-white rounded-lg shadow p-4">
+                    <div class="text-3xl font-bold text-gray-700">{{ pe_stats.totalEmails }}</div>
+                    <div class="text-sm text-gray-500">Total Emails</div>
+                </div>
+                <div class="bg-white rounded-lg shadow p-4">
+                    <div class="text-3xl font-bold text-orange-500">{{ pe_stats.duplicateEmails }}</div>
+                    <div class="text-sm text-gray-500">Duplicate Emails</div>
+                </div>
+                <div class="bg-white rounded-lg shadow p-4">
+                    <div class="text-sm text-gray-600">
+                        {% for event_type, data in pe_stats.byEventType.items() %}
+                        <div class="flex justify-between py-1">
+                            <span>{{ event_type }}</span>
+                            <span class="font-medium">{{ data.events }} <span class="text-xs text-gray-400">({{ data.emails }} emails)</span></span>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+            </div>
+        </section>
+        {% endif %}
+
+        <!-- Emails Section -->
+        <section class="mb-10">
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-xl font-semibold text-gray-800">📬 Recent Emails (Cosmos DB)</h2>
+                <span class="text-sm text-gray-500">{{ emails|length }} emails</span>
+            </div>
+            
+            <div class="bg-white rounded-lg shadow overflow-hidden">
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Received At</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">From</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Subject</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">📎</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Preview</th>
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+                            {% if emails %}
+                                {% for email in emails %}
+                                <tr class="hover:bg-gray-50 {% if email.isDuplicate %}bg-orange-50{% endif %}">
+                                    <td class="px-4 py-3 whitespace-nowrap">
+                                        <div class="flex flex-col gap-1">
+                                            <span class="px-2 py-1 text-xs font-medium rounded-full status-{{ email.status|default('pending') }}">
+                                                {{ email.status|default('pending')|upper }}
+                                            </span>
+                                            {% if email.isDuplicate %}
+                                            <span class="px-2 py-0.5 text-xs font-medium rounded-full badge-duplicate">
+                                                🔁 DUPLICATE
+                                            </span>
+                                            {% endif %}
+                                        </div>
+                                    </td>
+                                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-600">
+                                        {{ email.receivedAt|format_datetime }}
+                                    </td>
+                                    <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-900">
+                                        {{ email.from|truncate_text(30) }}
+                                    </td>
+                                    <td class="px-4 py-3 text-sm text-gray-900 max-w-xs truncate">
+                                        {{ email.subject|truncate_text(50) }}
+                                    </td>
+                                    <td class="px-4 py-3 whitespace-nowrap text-sm">
+                                        {% if email.hasAttachments %}
+                                            <span class="text-green-600">✅</span>
+                                        {% else %}
+                                            <span class="text-gray-400">—</span>
+                                        {% endif %}
+                                    </td>
+                                    <td class="px-4 py-3 text-sm text-gray-500 max-w-md">
+                                        {{ email.emailBody|truncate_html(50) }}
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            {% else %}
+                                <tr>
+                                    <td colspan="6" class="px-4 py-8 text-center text-gray-500">
+                                        No emails found in the database.
+                                    </td>
+                                </tr>
+                            {% endif %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- Queue Messages Section (Admin only) -->
+        <section id="queueSection">
+            <h2 class="text-xl font-semibold text-gray-800 mb-4">📨 Queue Messages (Service Bus)</h2>
+            
+            <div class="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6">
+                {% for queue_name in queue_names %}
+                <div class="bg-white rounded-lg shadow overflow-hidden">
+                    <div class="bg-gray-800 text-white px-4 py-3 flex items-center justify-between">
+                        <h3 class="font-medium">{{ queue_name }}</h3>
+                        <span class="bg-white/20 px-2 py-0.5 rounded text-xs">
+                            {{ queue_messages[queue_name]|length }} msgs
+                        </span>
+                    </div>
+                    
+                    <div class="divide-y divide-gray-100 max-h-96 overflow-y-auto">
+                        {% if queue_messages[queue_name] %}
+                            {% for msg in queue_messages[queue_name] %}
+                            <div class="p-3 hover:bg-gray-50">
+                                <div class="flex justify-between items-start mb-1">
+                                    <span class="text-xs text-gray-400">#{{ msg.sequence_number }}</span>
+                                    <span class="text-xs text-gray-400">{{ msg.enqueued_time|format_datetime }}</span>
+                                </div>
+                                
+                                {# Handle both intake queue (flat structure) and routed queues (nested original_email) #}
+                                {% set email = msg.body.original_email if msg.body.original_email else msg.body %}
+                                
+                                {# Sender #}
+                                {% if email.from or msg.body.from %}
+                                <p class="text-sm font-medium text-gray-900 truncate" title="{{ email.from or msg.body.from }}">
+                                    👤 {{ (email.from or msg.body.from)|truncate_text(35) }}
+                                </p>
+                                {% endif %}
+                                
+                                {# Subject #}
+                                {% if email.subject or msg.body.subject %}
+                                <p class="text-sm text-gray-700 truncate" title="{{ email.subject or msg.body.subject }}">
+                                    📌 {{ (email.subject or msg.body.subject)|truncate_text(40) }}
+                                </p>
+                                {% endif %}
+                                
+                                {# Classification info (for routed queues) #}
+                                {% if msg.body.category %}
+                                <div class="mt-2 flex flex-wrap gap-1">
+                                    <span class="text-xs bg-blue-100 text-blue-800 px-2 py-0.5 rounded">
+                                        {{ msg.body.category }}
+                                    </span>
+                                    <span class="text-xs bg-green-100 text-green-800 px-2 py-0.5 rounded">
+                                        {{ (msg.body.confidence * 100)|round|int }}%
+                                    </span>
+                                </div>
+                                {% endif %}
+                                
+                                {# PE Company and Fund Name (for routed queues) #}
+                                {% if msg.body.pe_company and msg.body.pe_company != 'Unknown' %}
+                                <p class="text-xs text-gray-600 mt-1 truncate" title="{{ msg.body.pe_company }}">
+                                    🏢 {{ msg.body.pe_company|truncate_text(30) }}
+                                </p>
+                                {% endif %}
+                                
+                                {% if msg.body.fund_name and msg.body.fund_name != 'Unknown' %}
+                                <p class="text-xs text-gray-600 truncate" title="{{ msg.body.fund_name }}">
+                                    💼 {{ msg.body.fund_name|truncate_text(30) }}
+                                </p>
+                                {% endif %}
+                                
+                                {# Received & Processed timestamps #}
+                                {% if email.receivedAt or msg.body.receivedAt %}
+                                <div class="mt-2 text-xs text-gray-400">
+                                    📥 Arrived: {{ (email.receivedAt or msg.body.receivedAt)|format_datetime }}
+                                </div>
+                                {% endif %}
+                                
+                                {% if msg.body.processedAt %}
+                                <div class="text-xs text-gray-400">
+                                    ⚡ Processed: {{ msg.body.processedAt|format_datetime }}
+                                </div>
+                                {% endif %}
+                                
+                                {# Attachments indicator #}
+                                {% if email.hasAttachments or msg.body.hasAttachments %}
+                                <div class="mt-1">
+                                    <span class="text-xs text-green-600">📎 Has attachments</span>
+                                </div>
+                                {% endif %}
+                            </div>
+                            {% endfor %}
+                        {% else %}
+                            <div class="p-4 text-center text-gray-400 text-sm">
+                                Queue is empty
+                            </div>
+                        {% endif %}
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </section>
+    </main>
+
+    <!-- Footer -->
+    <footer class="bg-gray-100 border-t mt-10">
+        <div class="container mx-auto px-6 py-4 text-center text-sm text-gray-500">
+            <p>Quintet PE Email Automation • MVP Dashboard</p>
+            <p id="profileIndicator" class="text-xs text-gray-400 mt-1">Viewing as: <span class="font-medium">Admin</span></p>
+        </div>
+    </footer>
+
+    <script>
+        // Profile switching (mockup - no backend auth)
+        function switchProfile(profile) {
+            const queueSection = document.getElementById('queueSection');
+            const profileIndicator = document.getElementById('profileIndicator');
+            
+            if (profile === 'admin') {
+                queueSection.style.display = 'block';
+                profileIndicator.innerHTML = 'Viewing as: <span class="font-medium text-primary">👑 Admin</span>';
+            } else {
+                queueSection.style.display = 'none';
+                profileIndicator.innerHTML = 'Viewing as: <span class="font-medium text-gray-600">👤 User</span>';
+            }
+            
+            // Save preference to localStorage
+            localStorage.setItem('dashboardProfile', profile);
+        }
+        
+        // Restore saved profile on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            const savedProfile = localStorage.getItem('dashboardProfile') || 'admin';
+            document.getElementById('profileSelect').value = savedProfile;
+            switchProfile(savedProfile);
+        });
+    </script>
+</body>
+</html>

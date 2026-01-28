@@ -1,0 +1,250 @@
+"""
+Document Intelligence Tool for extracting text and tables from PDFs.
+Uses Azure Document Intelligence with the Layout model.
+Authentication via DefaultAzureCredential (managed identity, CLI, VS Code).
+"""
+
+import os
+import json
+import logging
+from typing import Optional
+from datetime import datetime
+from azure.identity import DefaultAzureCredential
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.ai.documentintelligence.models import AnalyzeDocumentRequest, DocumentAnalysisFeature
+
+logger = logging.getLogger(__name__)
+
+
+class DocumentIntelligenceTool:
+    """Tool for processing documents with Azure Document Intelligence."""
+    
+    def __init__(self, endpoint: Optional[str] = None):
+        """
+        Initialize the Document Intelligence client.
+        
+        Args:
+            endpoint: Document Intelligence endpoint. If not provided, reads from
+                     DOCUMENT_INTELLIGENCE_ENDPOINT environment variable.
+        """
+        self.endpoint = endpoint or os.environ.get("DOCUMENT_INTELLIGENCE_ENDPOINT")
+        if not self.endpoint:
+            raise ValueError(
+                "Document Intelligence endpoint is required. "
+                "Set DOCUMENT_INTELLIGENCE_ENDPOINT environment variable."
+            )
+        
+        # Use DefaultAzureCredential for passwordless auth
+        self.credential = DefaultAzureCredential()
+        self.client = DocumentIntelligenceClient(
+            endpoint=self.endpoint,
+            credential=self.credential
+        )
+    
+    async def analyze_document_from_url(self, document_url: str) -> dict:
+        """
+        Analyze a document from a URL using the Layout model.
+        
+        Args:
+            document_url: URL to the PDF document (must be accessible)
+            
+        Returns:
+            Dictionary containing extracted text, tables, and metadata
+        """
+        logger.info(f"Analyzing document from URL: {document_url[:50]}...")
+        
+        try:
+            # Start the analysis with Layout model
+            poller = self.client.begin_analyze_document(
+                model_id="prebuilt-layout",
+                analyze_request=AnalyzeDocumentRequest(url_source=document_url),
+                features=[DocumentAnalysisFeature.KEY_VALUE_PAIRS]
+            )
+            
+            # Wait for completion
+            result = poller.result()
+            
+            return self._process_result(result, document_url)
+            
+        except Exception as e:
+            logger.error(f"Error analyzing document: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "document_url": document_url,
+                "analyzed_at": datetime.utcnow().isoformat()
+            }
+    
+    async def analyze_document_from_bytes(self, document_bytes: bytes, filename: str = "document.pdf") -> dict:
+        """
+        Analyze a document from bytes.
+        
+        Args:
+            document_bytes: Raw bytes of the document
+            filename: Name of the document for reference
+            
+        Returns:
+            Dictionary containing extracted text, tables, and metadata
+        """
+        logger.info(f"Analyzing document from bytes: {filename}")
+        
+        try:
+            # Start the analysis with Layout model
+            poller = self.client.begin_analyze_document(
+                model_id="prebuilt-layout",
+                analyze_request=document_bytes,
+                content_type="application/pdf",
+                features=[DocumentAnalysisFeature.KEY_VALUE_PAIRS]
+            )
+            
+            # Wait for completion
+            result = poller.result()
+            
+            return self._process_result(result, filename)
+            
+        except Exception as e:
+            logger.error(f"Error analyzing document: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "filename": filename,
+                "analyzed_at": datetime.utcnow().isoformat()
+            }
+    
+    def _process_result(self, result, source_reference: str) -> dict:
+        """
+        Process the Document Intelligence analysis result.
+        
+        Args:
+            result: AnalyzeResult from Document Intelligence
+            source_reference: Original URL or filename
+            
+        Returns:
+            Structured dictionary with extracted content
+        """
+        # Extract full text content
+        full_text = result.content if hasattr(result, 'content') else ""
+        
+        # Extract paragraphs
+        paragraphs = []
+        if hasattr(result, 'paragraphs') and result.paragraphs:
+            for para in result.paragraphs:
+                paragraphs.append({
+                    "content": para.content,
+                    "role": para.role if hasattr(para, 'role') else None
+                })
+        
+        # Extract tables with structure
+        tables = []
+        if hasattr(result, 'tables') and result.tables:
+            for table_idx, table in enumerate(result.tables):
+                table_data = {
+                    "table_index": table_idx,
+                    "row_count": table.row_count,
+                    "column_count": table.column_count,
+                    "cells": []
+                }
+                
+                # Extract cells with their positions
+                for cell in table.cells:
+                    table_data["cells"].append({
+                        "row_index": cell.row_index,
+                        "column_index": cell.column_index,
+                        "content": cell.content,
+                        "kind": cell.kind if hasattr(cell, 'kind') else "content",
+                        "row_span": cell.row_span if hasattr(cell, 'row_span') else 1,
+                        "column_span": cell.column_span if hasattr(cell, 'column_span') else 1
+                    })
+                
+                # Also create a row-based representation for easier processing
+                table_data["rows"] = self._cells_to_rows(table_data["cells"], table.row_count, table.column_count)
+                tables.append(table_data)
+        
+        # Extract key-value pairs
+        key_value_pairs = []
+        if hasattr(result, 'key_value_pairs') and result.key_value_pairs:
+            for kv in result.key_value_pairs:
+                key = kv.key.content if kv.key else ""
+                value = kv.value.content if kv.value else ""
+                key_value_pairs.append({
+                    "key": key,
+                    "value": value,
+                    "confidence": kv.confidence if hasattr(kv, 'confidence') else None
+                })
+        
+        # Document summary
+        page_count = len(result.pages) if hasattr(result, 'pages') else 0
+        
+        return {
+            "success": True,
+            "source": source_reference,
+            "analyzed_at": datetime.utcnow().isoformat(),
+            "page_count": page_count,
+            "full_text": full_text,
+            "paragraphs": paragraphs,
+            "tables": tables,
+            "table_count": len(tables),
+            "key_value_pairs": key_value_pairs,
+            # Summary for quick access
+            "summary": {
+                "text_length": len(full_text),
+                "paragraph_count": len(paragraphs),
+                "table_count": len(tables),
+                "kv_pair_count": len(key_value_pairs),
+                "first_500_chars": full_text[:500] if full_text else ""
+            }
+        }
+    
+    def _cells_to_rows(self, cells: list, row_count: int, column_count: int) -> list:
+        """
+        Convert flat cell list to row-based 2D array.
+        
+        Args:
+            cells: List of cell dictionaries
+            row_count: Number of rows in the table
+            column_count: Number of columns in the table
+            
+        Returns:
+            List of rows, where each row is a list of cell contents
+        """
+        # Initialize empty grid
+        grid = [["" for _ in range(column_count)] for _ in range(row_count)]
+        
+        # Fill in cells
+        for cell in cells:
+            row = cell["row_index"]
+            col = cell["column_index"]
+            if row < row_count and col < column_count:
+                grid[row][col] = cell["content"]
+        
+        return grid
+
+
+# Tool function definition for agent framework
+def get_document_intelligence_tool_definition() -> dict:
+    """
+    Returns the tool definition for the Azure AI Agent framework.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": "process_document",
+            "description": (
+                "Extracts text, tables, and key-value pairs from a PDF document using "
+                "Azure Document Intelligence. Use this tool to analyze PDF attachments "
+                "from emails to understand their content for classification. Returns "
+                "structured data including full text, tables (with rows/columns), and "
+                "any detected key-value pairs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document_url": {
+                        "type": "string",
+                        "description": "URL to the PDF document to analyze"
+                    }
+                },
+                "required": ["document_url"]
+            }
+        }
+    }
