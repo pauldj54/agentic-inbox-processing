@@ -128,3 +128,26 @@ email-intake → [Agent: Relevance Check] → [Agent: Classification + Entity Ex
 | `discarded` | Non-PE emails |
 | `human-review` | Low confidence (<65%) needs disambiguation |
 | `archival-pending` | Ready for archival (≥65% confidence) |
+
+## PE Event Deduplication Criteria
+
+PE events are deduplicated to prevent the same event from being created multiple times when duplicate emails arrive. A **deduplication key** (SHA256 hash, first 16 chars) is generated from these normalized fields:
+
+| Field | Description | Normalization |
+|-------|-------------|---------------|
+| `pe_company` | PE firm name | Lowercase, trimmed, common suffixes removed (llc, lp, inc, corp, ltd, partners, fund) |
+| `fund_name` | Fund name | Same normalization as pe_company |
+| `event_type` | Type of event (Capital Call, Distribution, etc.) | Lowercase, trimmed |
+| `amount` | Transaction amount (optional) | Only digits and decimal point kept |
+| `due_date` | Due date (optional) | Extracted to `YYYY-MM` format (month precision) |
+
+**Composite key format:** `pe_company|fund_name|event_type|amount|date_key`
+
+### Deduplication Behavior
+
+- **Month-level precision**: Dates are compared at `YYYY-MM`, so events in the same month are considered the same
+- **Fuzzy company matching**: Legal suffixes like "LLC", "LP", "Partners" are stripped before comparison
+- **When duplicate detected**:
+  - Email is linked to the existing PE event via `peEventId`
+  - Email is marked with `isDuplicate = True`
+  - No new PE event is created

@@ -168,10 +168,22 @@ def format_datetime(dt_value) -> str:
     return str(dt_value)
 
 
+def parse_bool(value) -> bool:
+    """Parse a value that might be a string boolean to actual boolean.
+    Handles: 'True', 'true', 'FALSE', True, False, None, etc.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ("true", "yes", "1")
+    return bool(value)
+
+
 # Add template filters
 templates.env.filters["truncate_text"] = truncate_text
 templates.env.filters["truncate_html"] = truncate_html
 templates.env.filters["format_datetime"] = format_datetime
+templates.env.filters["parse_bool"] = parse_bool
 
 
 def _get_emails_from_cosmos_sync(limit: int = 20) -> list:

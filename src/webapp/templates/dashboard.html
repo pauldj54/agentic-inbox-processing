@@ -137,9 +137,10 @@
                                     <td class="px-4 py-3 text-sm text-gray-900 max-w-xs truncate">
                                         {{ email.subject|truncate_text(50) }}
                                     </td>
-                                    <td class="px-4 py-3 whitespace-nowrap text-sm">
-                                        {% if email.hasAttachments %}
-                                            <span class="text-green-600">✅</span>
+                                    <td class="px-4 py-3 whitespace-nowrap text-sm text-center">
+                                        {% set att_count = email.attachmentsCount or 0 %}
+                                        {% if email.hasAttachments|parse_bool or att_count|int > 0 %}
+                                            <span class="text-green-600" title="{{ att_count }} attachment(s)">✅ {{ att_count }}</span>
                                         {% else %}
                                             <span class="text-gray-400">—</span>
                                         {% endif %}
@@ -241,9 +242,10 @@
                                 {% endif %}
                                 
                                 {# Attachments indicator #}
-                                {% if email.hasAttachments or msg.body.hasAttachments %}
+                                {% set att_count = msg.body.attachmentsCount or 0 %}
+                                {% if email.hasAttachments|parse_bool or msg.body.hasAttachments|parse_bool or att_count|int > 0 %}
                                 <div class="mt-1">
-                                    <span class="text-xs text-green-600">📎 Has attachments</span>
+                                    <span class="text-xs text-green-600">📎 {{ att_count }} attachment(s)</span>
                                 </div>
                                 {% endif %}
                             </div>

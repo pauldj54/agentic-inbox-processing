@@ -7,13 +7,25 @@ Uses DefaultAzureCredential for passwordless authentication.
 import os
 import json
 import logging
-from typing import Optional, List
+from typing import Optional, List, Union
 from datetime import datetime
 from azure.identity import DefaultAzureCredential
 from azure.servicebus import ServiceBusClient, ServiceBusMessage
 from azure.servicebus.aio import ServiceBusClient as AsyncServiceBusClient
 
 logger = logging.getLogger(__name__)
+
+
+def parse_bool(value: Union[str, bool, None]) -> bool:
+    """
+    Parse a value that might be a string boolean to actual boolean.
+    Handles: 'True', 'true', 'FALSE', True, False, None, etc.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ("true", "yes", "1")
+    return bool(value) if value is not None else False
 
 
 class QueueTools:
@@ -121,9 +133,22 @@ class QueueTools:
         """
         import re
         
+        def normalize_fields(data: dict) -> dict:
+            """Normalize hasAttachments to boolean and attachmentsCount to int."""
+            # Normalize hasAttachments to boolean
+            if "hasAttachments" in data:
+                data["hasAttachments"] = parse_bool(data["hasAttachments"])
+            # Normalize attachmentsCount to int
+            att_count = data.get("attachmentsCount", 0)
+            try:
+                data["attachmentsCount"] = int(att_count) if att_count else 0
+            except (ValueError, TypeError):
+                data["attachmentsCount"] = 0
+            return data
+        
         try:
             # Try direct JSON parse first
-            return json.loads(body_str)
+            return normalize_fields(json.loads(body_str))
         except json.JSONDecodeError:
             pass
         
@@ -159,7 +184,7 @@ class QueueTools:
         
         try:
             fixed_json = fix_json_control_chars(body_str)
-            return json.loads(fixed_json)
+            return normalize_fields(json.loads(fixed_json))
         except json.JSONDecodeError as e:
             # Fallback: extract key fields via regex
             logger.warning(f"JSON parse failed, using regex extraction: {e}")

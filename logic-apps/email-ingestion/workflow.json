@@ -1,0 +1,258 @@
+{
+    "definition": {
+        "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+        "contentVersion": "1.0.0.0",
+        "triggers": {
+            "When_a_new_email_arrives_(V3)": {
+                "splitOn": "@triggerBody()?['value']",
+                "type": "ApiConnectionNotification",
+                "inputs": {
+                    "host": {
+                        "connection": {
+                            "name": "@parameters('$connections')['office365']['connectionId']"
+                        }
+                    },
+                    "fetch": {
+                        "pathTemplate": {
+                            "template": "/v3/Mail/OnNewEmail"
+                        },
+                        "method": "get",
+                        "queries": {
+                            "importance": "Any",
+                            "fetchOnlyWithAttachment": false,
+                            "includeAttachments": true,
+                            "folderPath": "Inbox"
+                        }
+                    },
+                    "subscribe": {
+                        "body": {
+                            "NotificationUrl": "@listCallbackUrl()"
+                        },
+                        "pathTemplate": {
+                            "template": "/GraphMailSubscriptionPoke/$subscriptions"
+                        },
+                        "method": "post",
+                        "queries": {
+                            "importance": "Any",
+                            "fetchOnlyWithAttachment": false,
+                            "folderPath": "Inbox"
+                        }
+                    }
+                },
+                "description": "Starts the flow when new emails arrive."
+            }
+        },
+        "actions": {
+            "Initialize_variables": {
+                "runAfter": {},
+                "type": "InitializeVariable",
+                "inputs": {
+                    "variables": [
+                        {
+                            "name": "AttachmentPaths",
+                            "type": "array"
+                        },
+                        {
+                            "name": "AttachmentsCount",
+                            "type": "integer",
+                            "value": 0
+                        }
+                    ]
+                }
+            },
+            "For_each_attachment": {
+                "foreach": "@triggerBody()?['attachments']",
+                "actions": {
+                    "Check_if_not_inline": {
+                        "actions": {
+                            "Create_blob_(V2)": {
+                                "type": "ApiConnection",
+                                "inputs": {
+                                    "host": {
+                                        "connection": {
+                                            "name": "@parameters('$connections')['azureblob']['connectionId']"
+                                        }
+                                    },
+                                    "method": "post",
+                                    "body": "@base64ToBinary(item()?['contentBytes'])",
+                                    "headers": {
+                                        "ReadFileMetadataFromServer": true
+                                    },
+                                    "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent('stdocprocdevizr2ch55'))}/files",
+                                    "queries": {
+                                        "folderPath": "/attachments",
+                                        "name": "@{triggerOutputs()?['body/id']}/@{item()?['name']}",
+                                        "queryParametersSingleEncoded": true
+                                    }
+                                },
+                                "runtimeConfiguration": {
+                                    "contentTransfer": {
+                                        "transferMode": "Chunked"
+                                    }
+                                }
+                            },
+                            "Append_to_AttachmentPaths": {
+                                "runAfter": {
+                                    "Create_blob_(V2)": [
+                                        "Succeeded"
+                                    ]
+                                },
+                                "type": "AppendToArrayVariable",
+                                "inputs": {
+                                    "name": "AttachmentPaths",
+                                    "value": "@{triggerOutputs()?['body/id']}/@{item()?['name']}"
+                                }
+                            },
+                            "Increment_AttachmentsCount": {
+                                "runAfter": {
+                                    "Append_to_AttachmentPaths": [
+                                        "Succeeded"
+                                    ]
+                                },
+                                "type": "IncrementVariable",
+                                "inputs": {
+                                    "name": "AttachmentsCount",
+                                    "value": 1
+                                }
+                            }
+                        },
+                        "else": {
+                            "actions": {}
+                        },
+                        "expression": {
+                            "and": [
+                                {
+                                    "equals": [
+                                        "@item()['isInline']",
+                                        "@false"
+                                    ]
+                                }
+                            ]
+                        },
+                        "type": "If"
+                    }
+                },
+                "runAfter": {
+                    "Initialize_variables": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "Foreach",
+                "runtimeConfiguration": {
+                    "concurrency": {
+                        "repetitions": 20
+                    }
+                }
+            },
+            "Create_or_update_email_document": {
+                "runAfter": {
+                    "For_each_attachment": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "ApiConnection",
+                "inputs": {
+                    "host": {
+                        "connection": {
+                            "name": "@parameters('$connections')['documentdb']['connectionId']"
+                        }
+                    },
+                    "method": "post",
+                    "body": {
+                        "id": "@{triggerBody()?['id']}",
+                        "status": "received",
+                        "confidenceLevel": "pending",
+                        "receivedAt": "@{triggerBody()?['receivedDateTime']}",
+                        "from": "@{triggerBody()?['from']}",
+                        "subject": "@{triggerBody()?['subject']}",
+                        "hasAttachments": "@greater(variables('AttachmentsCount'), 0)",
+                        "attachmentsCount": "@variables('AttachmentsCount')",
+                        "emailBody": "@{triggerBody()?['body']}",
+                        "attachmentPaths": "@variables('AttachmentPaths')",
+                        "processedAt": null,
+                        "classification": null,
+                        "archivalPath": null
+                    },
+                    "headers": {
+                        "x-ms-documentdb-is-upsert": true
+                    },
+                    "path": "/v2/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('emails')}/docs"
+                },
+                "description": "Creates/updates email document in Cosmos DB with attachment count (after processing attachments)"
+            },
+            "Send_message_to_Service_Bus": {
+                "runAfter": {
+                    "Create_or_update_email_document": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "ApiConnection",
+                "inputs": {
+                    "host": {
+                        "connection": {
+                            "name": "@parameters('$connections')['servicebus']['connectionId']"
+                        }
+                    },
+                    "method": "post",
+                    "body": {
+                        "ContentData": "@base64(concat('{','\n','  \"emailId\": \"',triggerOutputs()?['body/id'],'\",','\n','  \"from\": \"',triggerOutputs()?['body/from'],'\",','\n','  \"subject\": \"',triggerOutputs()?['body/subject'],'\",','\n','  \"bodyText\": \"',triggerOutputs()?['body/bodyPreview'],'\", ','\n','  \"receivedAt\": \"',triggerOutputs()?['body/receivedDateTime'],'\",','\n','  \"attachmentsCount\":',variables('AttachmentsCount'),' ,','\n','  \"hasAttachments\": ',greater(variables('AttachmentsCount'),0),',','\n','  \"attachmentPaths\": ',variables('AttachmentPaths'),',','\n','  \"priority\": \"normal\",','\n','  \"source\": \"logic-app-ingestion\"','\n','}'))"
+                    },
+                    "path": "/@{encodeURIComponent(encodeURIComponent('email-intake'))}/messages",
+                    "queries": {
+                        "systemProperties": "None"
+                    }
+                },
+                "description": "Sends email metadata to Service Bus for agent processing"
+            }
+        },
+        "outputs": {},
+        "parameters": {
+            "$connections": {
+                "type": "Object",
+                "defaultValue": {}
+            }
+        }
+    },
+    "parameters": {
+        "$connections": {
+            "value": {
+                "office365": {
+                    "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/office365",
+                    "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/office365",
+                    "connectionName": "office365",
+                    "connectionProperties": {}
+                },
+                "documentdb": {
+                    "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/documentdb",
+                    "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/documentdb",
+                    "connectionName": "documentdb",
+                    "connectionProperties": {
+                        "authentication": {
+                            "type": "ManagedServiceIdentity"
+                        }
+                    }
+                },
+                "azureblob": {
+                    "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/azureblob",
+                    "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/azureblob",
+                    "connectionName": "azureblob",
+                    "connectionProperties": {
+                        "authentication": {
+                            "type": "ManagedServiceIdentity"
+                        }
+                    }
+                },
+                "servicebus": {
+                    "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/servicebus",
+                    "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/servicebus",
+                    "connectionName": "servicebus",
+                    "connectionProperties": {
+                        "authentication": {
+                            "type": "ManagedServiceIdentity"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

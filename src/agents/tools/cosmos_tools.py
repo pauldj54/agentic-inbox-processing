@@ -7,13 +7,25 @@ import os
 import json
 import hashlib
 import logging
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Union
 from datetime import datetime
 from azure.identity import DefaultAzureCredential
 from azure.cosmos import CosmosClient, PartitionKey
 from azure.cosmos.aio import CosmosClient as AsyncCosmosClient
 
 logger = logging.getLogger(__name__)
+
+
+def parse_bool(value: Union[str, bool, None]) -> bool:
+    """
+    Parse a value that might be a string boolean to actual boolean.
+    Handles: 'True', 'true', 'FALSE', True, False, None, etc.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ("true", "yes", "1")
+    return bool(value) if value is not None else False
 
 
 class CosmosDBTools:
@@ -113,6 +125,8 @@ class CosmosDBTools:
                 old_status = None  # No existing document
                 if email_data:
                     logger.info(f"Creating new email document for {email_id[:20]}...")
+                    # Get attachment count
+                    att_count = email_data.get("attachmentsCount", 0)
                     doc = {
                         "id": email_id,
                         "emailId": email_id,
@@ -120,7 +134,8 @@ class CosmosDBTools:
                         "subject": email_data.get("subject", ""),
                         "emailBody": email_data.get("emailBody", email_data.get("bodyText", email_data.get("body", ""))),
                         "receivedAt": email_data.get("receivedAt", email_data.get("received_at", datetime.utcnow().isoformat())),
-                        "hasAttachments": email_data.get("hasAttachments", email_data.get("has_attachments", False)),
+                        "hasAttachments": parse_bool(email_data.get("hasAttachments", email_data.get("has_attachments", False))),
+                        "attachmentsCount": int(att_count) if att_count else 0,
                         "status": "received",  # Always start with received status (partition key)
                         "createdAt": datetime.utcnow().isoformat()
                     }
@@ -143,6 +158,15 @@ class CosmosDBTools:
                         doc["receivedAt"] = email_data.get("receivedAt", datetime.utcnow().isoformat())
                     if not doc.get("status"):
                         doc["status"] = "received"
+                    # Update attachment info ONLY if email_data has valid values, otherwise preserve existing
+                    email_att_count = email_data.get("attachmentsCount", 0)
+                    if email_att_count:
+                        doc["attachmentsCount"] = int(email_att_count)
+                        doc["hasAttachments"] = int(email_att_count) > 0
+                    elif not doc.get("attachmentsCount"):
+                        # Only set to 0 if document doesn't already have a value
+                        doc["hasAttachments"] = parse_bool(email_data.get("hasAttachments", False))
+                        doc["attachmentsCount"] = 0
             
             # Update classification fields
             if step == "relevance":

@@ -213,11 +213,21 @@ This email has been identified as PE-relevant. Classify it into EXACTLY ONE of t
 - **0.60-0.69**: Low confidence, significant uncertainty
 - **Below 0.60**: Very uncertain, likely needs human review
 
+### CRITICAL: Attachment Filename Confidence Rules
+When attachment FILENAMES contain explicit PE terminology, assign HIGH confidence:
+- **"Appel de fonds"** in filename → Capital Call with confidence ≥ 0.85
+- **"Capital Call" or "Drawdown"** in filename → Capital Call with confidence ≥ 0.85
+- **"Distribution"** in filename → Distribution Notice with confidence ≥ 0.85
+- **"NAV Statement" or "Capital Account"** in filename → Capital Account Statement with confidence ≥ 0.85
+- **Fund names** (e.g., "Opale Capital", "Blackstone") in filename → confidence ≥ 0.80
+
+**IMPORTANT**: Attachment filenames are STRONG evidence. If multiple attachments have the same PE terminology in their names, this is DEFINITIVE evidence → assign confidence 0.90+.
+
 ### Evidence Weighting
-1. **Attachment content** is the STRONGEST indicator - PDF text/tables often contain definitive classification signals
-2. **Email subject** is strong - often contains document type
-3. **Email body** provides context but may be generic forwarding text
-4. **Sender domain** can indicate institutional vs personal correspondence
+1. **Attachment FILENAMES** (50% weight) - Often contain explicit document type
+2. **Attachment content** (30% weight) - PDF text/tables contain classification signals
+3. **Email subject** (15% weight) - May contain document type
+4. **Email body** (5% weight) - Often generic forwarding text
 
 ## Entity Extraction
 You MUST extract the following entities from the email/attachments:
