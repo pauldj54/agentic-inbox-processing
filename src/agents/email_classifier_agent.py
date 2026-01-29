@@ -1,15 +1,16 @@
 """
 Email Classification Agent using Azure AI Agent Service.
 Implements a 2-step classification approach:
-1. Relevance check (subject + body)
-2. Full classification (subject + body + attachment content)
+1. Relevance check (subject + body) - Binary: PE-related or not
+2. Full classification (subject + body + attachment content) - PE event type
 """
 
 import os
 import json
 import logging
 import asyncio
-from typing import Optional
+import re
+from typing import Optional, Union
 from datetime import datetime
 from azure.identity import DefaultAzureCredential
 from azure.ai.agents import AgentsClient
@@ -37,6 +38,34 @@ from .tools.document_intelligence_tool import DocumentIntelligenceTool
 from .tools.cosmos_tools import CosmosDBTools
 
 logger = logging.getLogger(__name__)
+
+
+def parse_bool(value: Union[str, bool, None]) -> bool:
+    """
+    Parse a value that might be a string boolean (from Logic App) to actual boolean.
+    Handles: "True", "true", "TRUE", "False", "false", true, false, None, etc.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ("true", "yes", "1")
+    return bool(value)
+
+
+def extract_plain_text_from_html(html: str) -> str:
+    """
+    Extract plain text from HTML email body.
+    Removes HTML tags and extracts readable text.
+    """
+    if not html:
+        return ""
+    # Remove HTML tags
+    text = re.sub(r'<[^>]+>', ' ', html)
+    # Decode HTML entities
+    text = text.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+    # Collapse whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 
 class EmailClassificationAgent:
@@ -131,8 +160,57 @@ class EmailClassificationAgent:
         )
         
         try:
-            # Step 1: Relevance Check
+            # =====================================================
+            # STEP 1: PE RELEVANCE CHECK (Binary: YES/NO)
+            # =====================================================
+            # This is a binary decision based on email metadata + attachment names.
+            # - If NOT PE-relevant → route to discarded queue (end processing)
+            # - If PE-relevant → proceed to Step 2 (full classification)
             relevance_result = await self._check_relevance(email_data)
+            
+            # OVERRIDE: If subject contains "PE" and (has attachments OR body mentions docs), force relevance
+            # This handles cases where the model incorrectly marks PE emails as not relevant
+            subject = email_data.get("subject", "").lower()
+            body_text = email_data.get("bodyText", email_data.get("emailBody", "")).lower()
+            
+            # Extract plain text if HTML
+            if "<html" in body_text or "<body" in body_text:
+                body_text = extract_plain_text_from_html(body_text).lower()
+            
+            # Check for PE indicators in subject
+            subject_has_pe = any(term in subject for term in [
+                "pe ", "pe documents", "pe docs", "private equity", 
+                "capital call", "distribution", "appel de fonds"
+            ]) or subject.startswith("pe")
+            
+            # Check if we have attachments (properly parse string boolean)
+            has_attachments = parse_bool(email_data.get("hasAttachments", False))
+            attachment_count = email_data.get("attachmentCount", 0)
+            if isinstance(attachment_count, str):
+                try:
+                    attachment_count = int(attachment_count)
+                except ValueError:
+                    attachment_count = 0
+            
+            # Check if body mentions attachments
+            body_mentions_attachments = any(word in body_text for word in [
+                "attached", "document", "docs", "fichier", "pièce jointe", "enclosed"
+            ])
+            
+            # Override logic: if subject has PE and we have attachments or body mentions docs
+            should_override = (
+                not relevance_result.get("is_relevant", False) 
+                and subject_has_pe 
+                and (has_attachments or attachment_count > 0 or body_mentions_attachments)
+            )
+            
+            if should_override:
+                logger.warning(f"⚠️ OVERRIDE: Subject contains PE term, has_attachments={has_attachments}, "
+                             f"attachment_count={attachment_count}, body_mentions_docs={body_mentions_attachments}")
+                logger.warning(f"   Forcing relevance=true to allow full classification with attachments")
+                relevance_result["is_relevant"] = True
+                relevance_result["reasoning"] = f"OVERRIDE: {relevance_result.get('reasoning', '')} [Forced relevant: subject='{email_data.get('subject', '')}', hasAttachments={has_attachments}, attachmentCount={attachment_count}]"
+                relevance_result["initial_category"] = "Capital Call"  # Default guess
             
             # Log relevance check
             self.cosmos_tools.log_classification_event(
@@ -151,11 +229,11 @@ class EmailClassificationAgent:
                 email_data=email_data
             )
             
-            # If not relevant, route to discarded queue and skip detailed classification
+            # If NOT PE-relevant → route to discarded queue immediately
             if not relevance_result.get("is_relevant", False):
-                logger.info(f"Email marked as not PE-relevant: {relevance_result.get('reasoning', '')[:100]}")
+                logger.info(f"❌ Email NOT PE-relevant → DISCARDED: {relevance_result.get('reasoning', '')[:100]}")
                 
-                # Route to discarded queue (available for manual review if needed)
+                # Route to discarded queue
                 target_queue = self.queue_tools.route_email(
                     email_data=email_data,
                     confidence_score=relevance_result.get("confidence", 0.0),
@@ -172,7 +250,11 @@ class EmailClassificationAgent:
                     "routed_to": target_queue
                 }
             
-            # Step 2: Process attachments if relevant
+            logger.info(f"✅ Email IS PE-relevant → proceeding to PE event classification")
+            
+            # =====================================================
+            # STEP 2: PROCESS ATTACHMENTS (for PE-relevant emails)
+            # =====================================================
             attachment_analysis = await self._process_attachments(email_data)
             
             # Log attachment processing
@@ -183,7 +265,13 @@ class EmailClassificationAgent:
                     details={"attachment_count": len(attachment_analysis)}
                 )
             
-            # Step 3: Full Classification
+            # =====================================================
+            # STEP 3: PE EVENT TYPE CLASSIFICATION
+            # =====================================================
+            # Classify into one of the 10 PE event types.
+            # The confidence score from this step determines routing:
+            # - confidence >= 65% → archival-pending queue
+            # - confidence < 65%  → human-review queue
             classification_result = await self._classify_email(email_data, attachment_analysis)
             
             # Log classification
@@ -196,17 +284,19 @@ class EmailClassificationAgent:
             # Update email with final classification
             self.cosmos_tools.update_email_classification(
                 email_id=email_id,
-                classification=classification_result.get("category", "Others"),
+                classification=classification_result.get("category", "Capital Call"),  # Default to Capital Call for PE emails
                 confidence_score=classification_result.get("confidence", 0.0),
                 classification_details=classification_result,
                 step="final",
                 email_data=email_data
             )
             
-            # Step 4a: Check for duplicate PE event and link
+            # =====================================================
+            # STEP 4a: PE EVENT DEDUPLICATION
+            # =====================================================
             is_duplicate = False
             pe_event_id = None
-            if classification_result.get("category") not in ["Not PE Related", "Others"]:
+            if classification_result.get("category") not in ["Not PE Related"]:
                 try:
                     pe_event, is_duplicate = self.cosmos_tools.find_or_create_pe_event(
                         email_id=email_id,
@@ -242,14 +332,28 @@ class EmailClassificationAgent:
                         attachment_name=att.get("name", "unknown"),
                         table_index=idx,
                         table_data=table,
-                        classification=classification_result.get("category", "Others")
+                        classification=classification_result.get("category", "Capital Call")
                     )
             
-            # Step 5: Route based on confidence
+            # =====================================================
+            # STEP 5: ROUTE BASED ON CLASSIFICATION CONFIDENCE
+            # =====================================================
+            # Routing logic (for PE-relevant emails only):
+            # - confidence >= 65% → archival-pending queue (ready for archival)
+            # - confidence < 65%  → human-review queue (needs human disambiguation)
+            confidence = classification_result.get("confidence", 0.0)
+            category = classification_result.get("category", "Capital Call")
+            
+            logger.info(f"📊 Classification: {category} (confidence: {confidence:.1%})")
+            if confidence >= 0.65:
+                logger.info(f"   → Routing to archival-pending (confidence >= 65%)")
+            else:
+                logger.info(f"   → Routing to human-review (confidence < 65%)")
+            
             target_queue = self.queue_tools.route_email(
                 email_data=email_data,
-                confidence_score=classification_result.get("confidence", 0.0),
-                classification=classification_result.get("category", "Others"),
+                confidence_score=confidence,
+                classification=category,
                 classification_details=classification_result
             )
             
@@ -259,8 +363,8 @@ class EmailClassificationAgent:
                 "is_relevant": True,
                 "is_duplicate": is_duplicate,
                 "pe_event_id": pe_event_id,
-                "classification": classification_result.get("category", "Others"),
-                "confidence": classification_result.get("confidence", 0.0),
+                "category": category,
+                "confidence": confidence,
                 "fund_name": classification_result.get("fund_name", "Unknown"),
                 "pe_company": classification_result.get("pe_company", "Unknown"),
                 "reasoning": classification_result.get("reasoning", ""),
@@ -282,24 +386,65 @@ class EmailClassificationAgent:
     
     async def _check_relevance(self, email_data: dict) -> dict:
         """
-        Step 1: Quick relevance check based on email metadata.
+        Step 1: Binary relevance check - Is this email PE-related or not?
+        
+        This check uses email metadata INCLUDING attachment names to make a
+        binary decision. Attachment names are the strongest indicator.
         
         Args:
             email_data: Email content from queue
             
         Returns:
-            Relevance check result
+            Relevance check result with is_relevant (bool) decision
         """
-        logger.info("Performing relevance check...")
+        logger.info("Performing PE relevance check (binary decision)...")
         
-        # Prepare the user prompt
+        # Parse hasAttachments properly (Logic App may send string "True"/"False")
+        has_attachments = parse_bool(email_data.get("hasAttachments", False))
+        attachment_count = email_data.get("attachmentCount", 0)
+        if isinstance(attachment_count, str):
+            try:
+                attachment_count = int(attachment_count)
+            except ValueError:
+                attachment_count = 0
+        
+        logger.info(f"  hasAttachments: {has_attachments}, attachmentCount: {attachment_count}")
+        
+        # Get attachment paths - these are CRITICAL for relevance detection
+        attachment_paths = email_data.get("attachmentPaths", []) or email_data.get("attachmentNames", [])
+        
+        # Extract just the filename from paths (Logic App may send full path like "messageId/filename.pdf")
+        attachment_names = []
+        for path in attachment_paths:
+            if "/" in path:
+                # Extract filename after the last /
+                filename = path.split("/")[-1]
+                attachment_names.append(filename)
+            else:
+                attachment_names.append(path)
+        
+        if not attachment_names and (has_attachments or attachment_count > 0):
+            attachment_names = [f"[{attachment_count} attachment(s) present but names not available]"]
+        
+        logger.info(f"  Attachment names: {attachment_names}")
+        
+        # Format attachment names prominently for the model
+        attachment_names_str = "\n".join([f"  - {name}" for name in attachment_names]) if attachment_names else "None"
+        
+        # Get body text - handle both plain text and HTML
+        body_text = email_data.get("bodyText", "") or email_data.get("emailBody", "")
+        if "<html" in body_text.lower() or "<body" in body_text.lower():
+            body_text = extract_plain_text_from_html(body_text)
+        body_text = body_text[:2000]  # Limit body text
+        
+        # Prepare the user prompt with attachment names prominently displayed
         user_prompt = RELEVANCE_CHECK_USER_PROMPT.format(
-            sender=email_data.get("from", "Unknown"),
+            sender=email_data.get("from", email_data.get("sender", "Unknown")),
             subject=email_data.get("subject", "No subject"),
             received_date=email_data.get("receivedAt", "Unknown"),
-            body_text=email_data.get("bodyText", "")[:2000],  # Limit body text
-            has_attachments=email_data.get("hasAttachments", False),
-            attachment_names=", ".join(email_data.get("attachmentPaths", []))
+            body_text=body_text,
+            has_attachments=has_attachments,
+            attachment_names=attachment_names_str
         )
         
         # Create agent if not exists
@@ -347,28 +492,51 @@ class EmailClassificationAgent:
         Returns:
             List of processed attachment results
         """
-        if not email_data.get("hasAttachments", False):
+        # Properly parse hasAttachments (might be string "True" from Logic App)
+        has_attachments = parse_bool(email_data.get("hasAttachments", False))
+        attachment_count = email_data.get("attachmentCount", 0)
+        if isinstance(attachment_count, str):
+            try:
+                attachment_count = int(attachment_count)
+            except ValueError:
+                attachment_count = 0
+        
+        # Also check attachmentPaths length
+        attachment_paths = email_data.get("attachmentPaths", [])
+        if attachment_paths:
+            attachment_count = max(attachment_count, len(attachment_paths))
+        
+        if not has_attachments and attachment_count == 0:
+            logger.info("No attachments to process")
             return []
         
-        logger.info("Processing attachments...")
+        logger.info(f"Processing attachments (hasAttachments={has_attachments}, count={attachment_count})...")
         
         # Get email identifiers for Graph API
         graph_info = self.graph_tools.extract_email_info_from_message(email_data)
         user_id = graph_info.get("user_id")
         message_id = graph_info.get("message_id")
         
+        logger.info(f"Graph API identifiers - user_id: {user_id}, message_id: {message_id[:50] if message_id else 'None'}...")
+        
         if not user_id or not message_id:
             logger.warning("Missing user_id or message_id for attachment download")
+            logger.warning(f"  email_data keys: {list(email_data.keys())}")
             return []
         
         # Download PDF attachments
         try:
+            logger.info(f"Calling Graph API to download attachments...")
             pdf_attachments = await self.graph_tools.download_all_pdf_attachments(
                 user_id=user_id,
                 message_id=message_id
             )
+            logger.info(f"Downloaded {len(pdf_attachments)} PDF attachment(s)")
+            
+            if len(pdf_attachments) == 0:
+                logger.warning("Graph API returned 0 PDF attachments - check permissions or attachment types")
         except Exception as e:
-            logger.error(f"Error downloading attachments: {e}")
+            logger.error(f"Error downloading attachments: {e}", exc_info=True)
             return []
         
         # Process each attachment with Document Intelligence
@@ -377,6 +545,7 @@ class EmailClassificationAgent:
             try:
                 content_bytes = attachment.get("content_decoded")
                 if content_bytes:
+                    logger.info(f"Analyzing attachment: {attachment.get('name', 'unknown')}")
                     extracted = await self.doc_intel_tool.analyze_document_from_bytes(
                         document_bytes=content_bytes,
                         filename=attachment.get("name", "document.pdf")
@@ -406,6 +575,16 @@ class EmailClassificationAgent:
         """
         logger.info("Performing full classification...")
         
+        # Get attachment names from email_data as fallback
+        attachment_paths = email_data.get("attachmentPaths", []) or email_data.get("attachmentNames", [])
+        attachment_names = []
+        for path in attachment_paths:
+            if "/" in path:
+                filename = path.split("/")[-1]
+                attachment_names.append(filename)
+            else:
+                attachment_names.append(path)
+        
         # Build attachment analysis summary
         attachment_summary = ""
         for att in attachment_analysis:
@@ -428,8 +607,17 @@ class EmailClassificationAgent:
             
             attachment_summary += "\n---\n"
         
+        # If no attachment content was extracted, still provide attachment names as clues
         if not attachment_summary:
-            attachment_summary = "No PDF attachments found or processed."
+            if attachment_names:
+                attachment_summary = "**Attachment files present (content extraction pending):**\n"
+                for name in attachment_names:
+                    attachment_summary += f"  - {name}\n"
+                attachment_summary += "\n**IMPORTANT**: Use the attachment FILENAMES above as classification evidence. "
+                attachment_summary += "For example, 'Appel de fonds' = Capital Call, 'Distribution' = Distribution Notice."
+                logger.warning(f"No attachment content extracted, but filenames available: {attachment_names}")
+            else:
+                attachment_summary = "No PDF attachments found or processed."
         
         # Prepare the user prompt
         user_prompt = FULL_CLASSIFICATION_USER_PROMPT.format(

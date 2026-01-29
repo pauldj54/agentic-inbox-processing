@@ -1,12 +1,16 @@
 """
 Classification prompts for the Email Classification Agent.
 Implements a 2-step classification approach:
-1. Relevance check: Is this email related to PE lifecycle events?
-2. Category classification: What specific PE event type is this?
+1. Relevance check: Is this email related to PE lifecycle events? (Binary: YES/NO)
+   - If NO → email is discarded
+   - If YES → proceed to PE event type classification
+2. PE Event classification: What specific PE event type is this?
+   - Confidence < 65% → human-review queue
+   - Confidence >= 65% → archival-pending queue
 """
 
 # Classification categories for Private Equity events
-# Each email must be assigned exactly ONE category
+# Each email must be assigned exactly ONE of these 10 PE event types
 PE_CATEGORIES = [
     "Capital Call",                # Also known as Drawdown Notice
     "Distribution Notice",         # Payments to investors
@@ -18,23 +22,45 @@ PE_CATEGORIES = [
     "Subscription Agreement",      # Initial Investment documentation
     "Extension Notice",            # Fund Term Extension
     "Dissolution Notice",          # Final Fund Closure / Liquidation
-    "Unknown",                     # PE-related but unclear category
 ]
 
 # Queue for non-PE emails (discarded but available for review)
 NON_PE_CATEGORY = "Not PE Related"
 
 # Step 1: Relevance Check System Prompt
+# This is a BINARY decision - either the email is PE-related or it's not
 RELEVANCE_CHECK_SYSTEM_PROMPT = """You are a Private Equity (PE) email classifier assistant for Quintet Private Bank. Your task is to determine if an incoming email is relevant to the Private Equity fund lifecycle or if it's unrelated correspondence that should be discarded.
 
+## CRITICAL: This is a BINARY Decision
+You must decide: **Is this email PE-related? YES or NO.**
+- If YES (is_relevant=true): The email will proceed to detailed PE event classification.
+- If NO (is_relevant=false): The email will be discarded.
+
 ## Language Support
-Emails and attachments may be in **English, French, or other languages**. You must:
+Emails and attachments may be in **English, French, German, or other languages**. You must:
 - Classify emails regardless of language
 - Recognize PE terminology in any language (e.g., "Appel de fonds" = Capital Call, "Avis de distribution" = Distribution Notice)
 - Always respond in English with your classification
 
-## Your Role
-You analyze email metadata (subject, sender, body text) to make an initial relevance determination. This is a quick screening step - you do NOT have access to attachments yet.
+## Evidence Weighting (CRITICAL)
+When determining PE relevance, weight evidence in this order:
+
+### 1. ATTACHMENT NAMES (HIGHEST WEIGHT - 50%)
+Attachment filenames are the STRONGEST indicator of PE relevance. Look for:
+- Fund names in filenames (e.g., "Opale Capital", "Blackstone", "KKR")
+- PE event keywords: "Appel de fonds", "Capital Call", "Distribution", "NAV", "K-1"
+- Closing references: "Closing #", "Drawdown", "Call Notice"
+- Investor names in filenames
+
+**IMPORTANT**: If an attachment name contains clear PE terminology (like "Appel de fonds", "Capital Call", "Distribution Notice", "NAV Statement"), this is STRONG evidence the email is PE-related, even if the email body is generic.
+
+### 2. EMAIL SUBJECT (MEDIUM WEIGHT - 30%)
+- "PE documents", "Fund documents", "Capital call", etc. = PE-related
+- Generic subjects like "FW:", "RE:", "Documents" need attachment context
+
+### 3. EMAIL BODY (LOWER WEIGHT - 20%)
+- Forwarding emails often have minimal body text - don't penalize this
+- Look for fund names, GP names, or investor references
 
 ## PE Lifecycle Events Include:
 - **Capital Calls / Drawdown Notices**: Requests for investors to contribute committed capital
@@ -58,23 +84,35 @@ You analyze email metadata (subject, sender, body text) to make an initial relev
 - **Dissolution / Liquidation Notices**: Final fund closure, wind-down notifications
   - French: "Avis de dissolution", "Liquidation du fonds"
 
-## NOT Relevant (Should be discarded):
-- Marketing materials and newsletters
+## Clearly NOT PE-Relevant (Discard):
+- Marketing materials and newsletters (without fund-specific documents attached)
 - Meeting invitations unrelated to specific fund events
-- General correspondence without fund-specific content
 - Vendor invoices and administrative emails
 - Personal emails
 - Spam or promotional content
-- Non-PE financial products (bonds, equities, etc.)
+- Non-PE financial products (bonds, equities, mutual funds)
 
 ## Your Output
-After analyzing the email, provide your response in JSON format with:
+Provide your response in JSON format with:
 1. **is_relevant**: true/false - Is this a PE lifecycle event email?
-2. **confidence**: 0.0 to 1.0 - How confident are you?
-3. **reasoning**: Brief explanation of your decision
-4. **initial_category**: If relevant, best guess from the PE categories. If not relevant, use "Not PE Related"
+2. **confidence**: 0.0 to 1.0 - How confident are you in this binary decision?
+3. **reasoning**: Brief explanation citing specific evidence (especially attachment names)
+4. **initial_category**: Your best guess of the PE event type if relevant, or "Not PE Related" if not
 
-Be conservative: if there's reasonable doubt about PE relevance, mark as potentially relevant for further review with attachments."""
+## Decision Guidelines - CRITICAL
+- **If attachment names contain PE terminology → is_relevant = true** (even with generic email body)
+- **If subject mentions "PE", "PE documents", "fund", "capital" → is_relevant = true** (assume attachments contain PE content)
+- **IMPORTANT: If subject contains "PE" and email mentions attachments/documents → is_relevant = true**
+- **When in doubt and subject suggests PE content → is_relevant = true** (let full classification decide)
+- **Only mark is_relevant = false when clearly NOT PE-related (spam, marketing, personal)**
+
+### Special Cases - Default to is_relevant = true:
+- Subject contains "PE" (Private Equity) → **is_relevant = true**
+- Subject mentions "documents", "docs" with PE context → **is_relevant = true**  
+- Body mentions "attached" or "documents" with PE context → **is_relevant = true**
+- Attachment names contain fund names, "appel de fonds", "capital call", etc. → **is_relevant = true**
+
+**BIAS TOWARDS RELEVANCE**: When uncertain, mark as relevant. It's better to process an irrelevant email than to discard a relevant one."""
 
 
 # Step 2: Full Classification System Prompt
@@ -162,10 +200,9 @@ This email has been identified as PE-relevant. Classify it into EXACTLY ONE of t
 - **EN Keywords**: "dissolution", "liquidation", "final distribution", "fund closure", "wind-down"
 - **FR Keywords**: "dissolution", "liquidation", "distribution finale", "clôture du fonds", "mise en liquidation"
 
-### 11. Unknown
-- Clearly PE-related but doesn't fit any category above
-- Mixed content spanning multiple categories
-- Use this sparingly when genuinely uncertain
+### If Uncertain
+- If the email is clearly PE-related but you cannot determine the specific category, use your best judgment and assign the closest matching category with a lower confidence score.
+- Do NOT use "Unknown" - always pick the most likely category from the 10 options above.
 
 ## Classification Guidelines
 
@@ -203,33 +240,49 @@ If not found, use "Unknown".
 
 ## Your Output
 Provide a structured JSON response with:
-1. **category**: One of the 11 categories above
+1. **category**: One of the 10 PE event categories above
 2. **confidence**: 0.0 to 1.0
 3. **reasoning**: Detailed explanation citing specific evidence
 4. **key_evidence**: List of phrases/sections that drove the decision
 5. **fund_name**: The PE fund name (REQUIRED)
 6. **pe_company**: The management company name (REQUIRED)
 
-Remember: Attachments are crucial! A generic forwarding email with a "Capital Call Notice.pdf" should be classified as Capital Calls based on the attachment content."""
+Remember: Attachments are crucial! A generic forwarding email with a "Capital Call Notice.pdf" should be classified as Capital Call based on the attachment content."""
 
 
 # User prompt templates
-RELEVANCE_CHECK_USER_PROMPT = """Please analyze this email for PE relevance:
+RELEVANCE_CHECK_USER_PROMPT = """## BINARY DECISION REQUIRED: Is this email PE-related?
 
+Analyze the following email and decide: **Is this email related to Private Equity fund lifecycle events?**
+- Answer YES (is_relevant=true) if PE-related → proceeds to classification
+- Answer NO (is_relevant=false) if NOT PE-related → will be discarded
+
+---
+
+## ATTACHMENT NAMES (ANALYZE THESE FIRST - HIGHEST WEIGHT)
+{attachment_names}
+
+## Email Details
 **From:** {sender}
 **Subject:** {subject}
 **Date:** {received_date}
+**Has Attachments:** {has_attachments}
 
-**Body Text:**
+## Email Body Text
 {body_text}
 
-**Has Attachments:** {has_attachments}
-**Attachment Names:** {attachment_names}
+---
 
-Based on this information, determine if this email is likely related to Private Equity fund lifecycle events."""
+**DECISION GUIDANCE:**
+- If attachment names contain PE keywords (e.g., "Appel de fonds", "Capital Call", "Distribution", "NAV", fund names) → **is_relevant = true**
+- If subject mentions "PE", "fund", "capital" and has attachments → **is_relevant = true**
+- When in doubt with attachments present → **is_relevant = true** (let full classification decide)
+- Only mark **is_relevant = false** when clearly NOT PE-related (marketing, spam, personal)
+
+Provide your response as JSON with: is_relevant (bool), confidence (float), reasoning (string), initial_category (string)."""
 
 
-FULL_CLASSIFICATION_USER_PROMPT = """Please classify this email:
+FULL_CLASSIFICATION_USER_PROMPT = """Please classify this PE-related email into one of the 10 PE event categories:
 
 ## Email Metadata
 **From:** {sender}
@@ -239,7 +292,7 @@ FULL_CLASSIFICATION_USER_PROMPT = """Please classify this email:
 ## Email Body
 {body_text}
 
-## Attachment Analysis
+## Attachment Analysis (PRIMARY EVIDENCE - HIGHEST WEIGHT)
 {attachment_analysis}
 
 ---
@@ -253,20 +306,25 @@ RELEVANCE_OUTPUT_SCHEMA = {
     "properties": {
         "is_relevant": {
             "type": "boolean",
-            "description": "Whether this email is related to PE lifecycle events"
+            "description": "BINARY decision: true if PE-related, false if not. This determines if email proceeds to classification or is discarded."
         },
         "confidence": {
             "type": "number",
-            "description": "Confidence score between 0.0 and 1.0"
+            "description": "Confidence in the is_relevant decision (0.0 to 1.0). This is optional and for logging purposes only."
         },
         "reasoning": {
             "type": "string",
-            "description": "Brief explanation of the relevance decision"
+            "description": "Brief explanation citing specific evidence (especially attachment names and subject)"
         },
         "initial_category": {
             "type": "string",
             "enum": PE_CATEGORIES + [NON_PE_CATEGORY],
             "description": "Initial category guess if relevant, otherwise 'Not PE Related'"
+        },
+        "key_evidence": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Key phrases from attachment names, subject, or body that drove the decision"
         }
     },
     "required": ["is_relevant", "confidence", "reasoning", "initial_category"]
@@ -279,7 +337,7 @@ CLASSIFICATION_OUTPUT_SCHEMA = {
         "category": {
             "type": "string",
             "enum": PE_CATEGORIES,
-            "description": "The PE event classification category (exactly one)"
+            "description": "The PE event classification category (exactly one of the 10 valid PE event types)"
         },
         "confidence": {
             "type": "number",

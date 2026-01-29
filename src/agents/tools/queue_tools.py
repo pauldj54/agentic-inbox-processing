@@ -167,13 +167,37 @@ class QueueTools:
             email_match = re.search(r'"emailId":\s*"([^"]*)"', body_str)
             from_match = re.search(r'"from":\s*"([^"]*)"', body_str)
             subject_match = re.search(r'"subject":\s*"([^"]*)"', body_str)
-            body_text_match = re.search(r'"bodyText":\s*"(.*?)"(?=,|\})', body_str, re.DOTALL)
+            body_text_match = re.search(r'"bodyText":\s*"(.*?)"(?=,\s*"|\})', body_str, re.DOTALL)
+            received_at_match = re.search(r'"receivedAt":\s*"([^"]*)"', body_str)
+            
+            # Extract hasAttachments (handles both boolean True/False and string "True"/"False")
+            has_attachments_match = re.search(r'"hasAttachments":\s*(true|false|True|False|"True"|"False")', body_str, re.IGNORECASE)
+            has_attachments = False
+            if has_attachments_match:
+                val = has_attachments_match.group(1).strip('"').lower()
+                has_attachments = val == "true"
+            
+            # Extract attachmentPaths array - this is CRITICAL for PE classification
+            attachment_paths = []
+            attachment_paths_match = re.search(r'"attachmentPaths":\s*\[(.*?)\]', body_str, re.DOTALL)
+            if attachment_paths_match:
+                paths_content = attachment_paths_match.group(1)
+                # Extract individual paths from the array
+                path_matches = re.findall(r'"([^"]+)"', paths_content)
+                attachment_paths = path_matches
+            
+            logger.warning(f"Regex extraction: hasAttachments={has_attachments}, attachmentPaths count={len(attachment_paths)}")
+            if attachment_paths:
+                logger.info(f"Attachment paths found: {attachment_paths}")
             
             return {
                 "emailId": email_match.group(1) if email_match else "unknown",
                 "from": from_match.group(1) if from_match else "unknown",
                 "subject": subject_match.group(1) if subject_match else "unknown",
                 "bodyText": body_text_match.group(1)[:500] if body_text_match else "",
+                "receivedAt": received_at_match.group(1) if received_at_match else "",
+                "hasAttachments": has_attachments,
+                "attachmentPaths": attachment_paths,
                 "_parse_note": "Extracted via regex due to JSON parsing issues"
             }
     

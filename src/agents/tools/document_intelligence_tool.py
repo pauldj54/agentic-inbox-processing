@@ -111,87 +111,61 @@ class DocumentIntelligenceTool:
                 "analyzed_at": datetime.utcnow().isoformat()
             }
     
-    def _process_result(self, result, source_reference: str) -> dict:
+    def _process_result(self, result, source_reference: str, compact: bool = True) -> dict:
         """
         Process the Document Intelligence analysis result.
         
         Args:
             result: AnalyzeResult from Document Intelligence
             source_reference: Original URL or filename
+            compact: If True, return minimal data for classification (default: True)
             
         Returns:
             Structured dictionary with extracted content
         """
-        # Extract full text content
+        # Extract full text content (limited for compact mode)
         full_text = result.content if hasattr(result, 'content') else ""
         
-        # Extract paragraphs
-        paragraphs = []
-        if hasattr(result, 'paragraphs') and result.paragraphs:
-            for para in result.paragraphs:
-                paragraphs.append({
-                    "content": para.content,
-                    "role": para.role if hasattr(para, 'role') else None
-                })
+        # In compact mode, limit text to first 3000 chars to reduce token usage
+        if compact and len(full_text) > 3000:
+            full_text = full_text[:3000] + "\n... [text truncated for processing]"
         
-        # Extract tables with structure
+        # Extract tables with structure (essential for PE document classification)
         tables = []
         if hasattr(result, 'tables') and result.tables:
-            for table_idx, table in enumerate(result.tables):
+            for table_idx, table in enumerate(result.tables[:5]):  # Limit to first 5 tables
                 table_data = {
                     "table_index": table_idx,
                     "row_count": table.row_count,
                     "column_count": table.column_count,
-                    "cells": []
                 }
                 
-                # Extract cells with their positions
-                for cell in table.cells:
-                    table_data["cells"].append({
-                        "row_index": cell.row_index,
-                        "column_index": cell.column_index,
-                        "content": cell.content,
-                        "kind": cell.kind if hasattr(cell, 'kind') else "content",
-                        "row_span": cell.row_span if hasattr(cell, 'row_span') else 1,
-                        "column_span": cell.column_span if hasattr(cell, 'column_span') else 1
-                    })
-                
-                # Also create a row-based representation for easier processing
-                table_data["rows"] = self._cells_to_rows(table_data["cells"], table.row_count, table.column_count)
+                # Create row-based representation directly (skip cells for compact mode)
+                table_data["rows"] = self._cells_to_rows(
+                    [{"row_index": c.row_index, "column_index": c.column_index, "content": c.content}
+                     for c in table.cells],
+                    min(table.row_count, 15),  # Limit rows for compact mode
+                    table.column_count
+                )
                 tables.append(table_data)
-        
-        # Extract key-value pairs
-        key_value_pairs = []
-        if hasattr(result, 'key_value_pairs') and result.key_value_pairs:
-            for kv in result.key_value_pairs:
-                key = kv.key.content if kv.key else ""
-                value = kv.value.content if kv.value else ""
-                key_value_pairs.append({
-                    "key": key,
-                    "value": value,
-                    "confidence": kv.confidence if hasattr(kv, 'confidence') else None
-                })
         
         # Document summary
         page_count = len(result.pages) if hasattr(result, 'pages') else 0
         
+        # Compact output for classification - skip paragraphs and key-value pairs
         return {
             "success": True,
             "source": source_reference,
             "analyzed_at": datetime.utcnow().isoformat(),
             "page_count": page_count,
             "full_text": full_text,
-            "paragraphs": paragraphs,
             "tables": tables,
             "table_count": len(tables),
-            "key_value_pairs": key_value_pairs,
             # Summary for quick access
             "summary": {
-                "text_length": len(full_text),
-                "paragraph_count": len(paragraphs),
+                "text_length": len(result.content) if hasattr(result, 'content') else 0,
                 "table_count": len(tables),
-                "kv_pair_count": len(key_value_pairs),
-                "first_500_chars": full_text[:500] if full_text else ""
+                "first_500_chars": (result.content[:500] if hasattr(result, 'content') and result.content else "")
             }
         }
     

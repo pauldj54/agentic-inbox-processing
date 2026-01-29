@@ -1,14 +1,20 @@
 """
 Microsoft Graph API Tools for email attachment handling.
 Downloads attachments from M365 using Graph API.
-Uses DefaultAzureCredential for passwordless authentication.
+
+Authentication options (in order of preference):
+1. Client credentials (App Registration): Set GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET, GRAPH_TENANT_ID
+2. DefaultAzureCredential: Falls back to Azure CLI, Managed Identity, etc.
+
+For accessing other users' mailboxes, you need Application permissions (Mail.Read or Mail.ReadBasic.All)
+granted via App Registration with admin consent.
 """
 
 import os
 import logging
 import base64
 from typing import Optional, List
-from azure.identity import DefaultAzureCredential
+from azure.identity import DefaultAzureCredential, ClientSecretCredential
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -20,8 +26,30 @@ class GraphAPITools:
     GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
     
     def __init__(self):
-        """Initialize the Graph API client."""
-        self.credential = DefaultAzureCredential()
+        """
+        Initialize the Graph API client.
+        
+        Uses ClientSecretCredential if GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET, and 
+        GRAPH_TENANT_ID are set. Otherwise falls back to DefaultAzureCredential.
+        """
+        # Check for explicit Graph API credentials (App Registration)
+        self.client_id = os.environ.get("GRAPH_CLIENT_ID")
+        self.client_secret = os.environ.get("GRAPH_CLIENT_SECRET")
+        self.tenant_id = os.environ.get("GRAPH_TENANT_ID")
+        
+        if self.client_id and self.client_secret and self.tenant_id:
+            logger.info("Using ClientSecretCredential for Graph API (App Registration)")
+            self.credential = ClientSecretCredential(
+                tenant_id=self.tenant_id,
+                client_id=self.client_id,
+                client_secret=self.client_secret
+            )
+            self._use_client_secret = True
+        else:
+            logger.info("Using DefaultAzureCredential for Graph API")
+            self.credential = DefaultAzureCredential()
+            self._use_client_secret = False
+        
         self._token_cache = None
     
     def _get_token(self) -> str:
@@ -31,10 +59,14 @@ class GraphAPITools:
     
     async def _get_token_async(self) -> str:
         """Get an access token asynchronously."""
-        from azure.identity.aio import DefaultAzureCredential as AsyncCredential
-        async with AsyncCredential() as credential:
-            token = await credential.get_token("https://graph.microsoft.com/.default")
-            return token.token
+        if self._use_client_secret:
+            # ClientSecretCredential works synchronously, just call sync method
+            return self._get_token()
+        else:
+            from azure.identity.aio import DefaultAzureCredential as AsyncCredential
+            async with AsyncCredential() as credential:
+                token = await credential.get_token("https://graph.microsoft.com/.default")
+                return token.token
     
     async def get_email_attachments(self, user_id: str, message_id: str) -> List[dict]:
         """
