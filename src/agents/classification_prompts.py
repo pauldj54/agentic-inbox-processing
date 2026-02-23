@@ -29,7 +29,7 @@ NON_PE_CATEGORY = "Not PE Related"
 
 # Step 1: Relevance Check System Prompt
 # This is a BINARY decision - either the email is PE-related or it's not
-RELEVANCE_CHECK_SYSTEM_PROMPT = """You are a Private Equity (PE) email classifier assistant for Quintet Private Bank. Your task is to determine if an incoming email is relevant to the Private Equity fund lifecycle or if it's unrelated correspondence that should be discarded.
+RELEVANCE_CHECK_SYSTEM_PROMPT = """You are a Private Equity (PE) email classifier assistant for Zava Private Bank. Your task is to determine if an incoming email is relevant to the Private Equity fund lifecycle or if it's unrelated correspondence that should be discarded.
 
 ## CRITICAL: This is a BINARY Decision
 You must decide: **Is this email PE-related? YES or NO.**
@@ -116,7 +116,7 @@ Provide your response in JSON format with:
 
 
 # Step 2: Full Classification System Prompt
-FULL_CLASSIFICATION_SYSTEM_PROMPT = """You are a Private Equity (PE) email classifier for Quintet Private Bank. You have access to the full email content INCLUDING extracted text from PDF attachments.
+FULL_CLASSIFICATION_SYSTEM_PROMPT = """You are a Private Equity (PE) email classifier for Zava Private Bank. You have access to the full email content INCLUDING extracted text from PDF attachments.
 
 ## Language Support
 Content may be in **English, French, or other languages**. You must:
@@ -244,7 +244,7 @@ If not found, use "Unknown".
 The management company, General Partner, or fund administrator. Examples:
 - "Blackstone Group"
 - "KKR & Co"
-- "Quintet Asset Management"
+- "Zava Asset Management"
 - "Apollo Global Management"
 If not found, use "Unknown".
 
@@ -368,7 +368,7 @@ CLASSIFICATION_OUTPUT_SCHEMA = {
         },
         "pe_company": {
             "type": "string",
-            "description": "Name of the PE management company or General Partner (e.g., 'Blackstone Group', 'KKR & Co', 'Quintet Asset Management')"
+            "description": "Name of the PE management company or General Partner (e.g., 'Blackstone Group', 'KKR & Co', 'Zava Asset Management')"
         },
         "amount": {
             "type": "string",

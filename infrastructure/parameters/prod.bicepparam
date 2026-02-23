@@ -5,9 +5,9 @@
 using '../main.bicep'
 
 param environment = 'prod'
-param baseName = 'quintet'
+param baseName = 'zava'
 param tags = {
-  project: 'quintet-pe-automation'
+  project: 'zava-pe-automation'
   environment: 'prod'
   managedBy: 'bicep'
   costCenter: 'operations'

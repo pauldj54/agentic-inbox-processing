@@ -1,4 +1,4 @@
-# Quintet PE Email Automation - Infrastructure
+# Zava PE Email Automation - Infrastructure
 
 ## Overview
 
@@ -8,7 +8,7 @@ This folder contains Azure Bicep templates for deploying the email processing au
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           QUINTET PE EMAIL AUTOMATION                           │
+│                            ZAVA PE EMAIL AUTOMATION                             │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
 │  ┌──────────────┐     ┌──────────────┐     ┌──────────────────────────────────┐│
@@ -112,11 +112,11 @@ az login
 az account set --subscription "<subscription-id>"
 
 # Create resource group
-az group create --name rg-quintet-dev --location westeurope
+az group create --name rg-zava-dev --location westeurope
 
 # Deploy infrastructure
 az deployment group create \
-  --resource-group rg-quintet-dev \
+  --resource-group rg-zava-dev \
   --template-file infrastructure/main.bicep \
   --parameters infrastructure/parameters/dev.bicepparam
 ```
@@ -124,10 +124,10 @@ az deployment group create \
 ### Deploy to Production
 
 ```bash
-az group create --name rg-quintet-prod --location westeurope
+az group create --name rg-zava-prod --location westeurope
 
 az deployment group create \
-  --resource-group rg-quintet-prod \
+  --resource-group rg-zava-prod \
   --template-file infrastructure/main.bicep \
   --parameters infrastructure/parameters/prod.bicepparam
 ```

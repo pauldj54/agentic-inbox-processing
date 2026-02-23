@@ -1,5 +1,5 @@
 // ============================================================================
-// Quintet PE Email Automation - Main Infrastructure Template
+// Zava PE Email Automation - Main Infrastructure Template
 // ============================================================================
 // This template orchestrates the deployment of all Azure resources for the
 // email processing automation MVP.
