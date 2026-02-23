@@ -1,30 +1,30 @@
-# Requirements for Microsoft Agent Framework Lab
+# Requirements for Agentic Inbox Processing
+# Private Equity Email Classification System
+# ==========================================
 
-# Core packages
-agent-framework
+# Azure Identity & Core
 azure-identity>=1.15.0
-azure-ai-projects>=1.0.0
-azure-ai-agents>=1.0.0
 azure-core>=1.28.0
 
-# Azure Service Bus SDK
+# Azure AI Agent Service (for LLM-powered classification)
+azure-ai-projects>=1.0.0
+azure-ai-agents>=1.0.0
+
+# Azure Service Bus SDK (message queue for email routing)
 azure-servicebus>=7.12.0
 
-# Azure Cosmos DB SDK (async)
-aiohttp>=3.9.0
+# Azure Cosmos DB SDK (email storage and audit logs)
 azure-cosmos>=4.7.0
+aiohttp>=3.9.0
 
-# Azure Document Intelligence (Form Recognizer)
+# Azure Document Intelligence (PDF attachment extraction)
 azure-ai-documentintelligence>=1.0.0
 
-# FastAPI Web Framework
+# FastAPI Web Framework (dashboard UI)
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
 gunicorn>=21.0.0
 jinja2>=3.1.0
 
-# Microsoft Graph SDK for email access
-msgraph-sdk>=1.0.0
-
-# Optional but recommended
-python-dotenv>=1.0.0  # For .env file support
+# Environment configuration
+python-dotenv>=1.0.0

@@ -157,3 +157,6 @@ Thumbs.db
 
 # Local development
 *.local
+
+# Documentation (internal/private)
+docs/
