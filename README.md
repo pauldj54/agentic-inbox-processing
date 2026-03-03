@@ -22,9 +22,10 @@ This solution provides:
 - **Automated Classification**: Uses Azure AI Agent Service (GPT-4o) to classify incoming PE emails
 - **Multi-step Processing**: 2-stage classification (relevance check → detailed categorization)
 - **Attachment Analysis**: Extracts text from PDF attachments using Azure Document Intelligence
+- **Download-Link Intake**: Detects download links in email bodies, downloads the documents, and stores them in Azure Blob Storage using the same convention as regular attachments
 - **Entity Extraction**: Automatically extracts fund names, PE company names, amounts, and dates
 - **Confidence-based Routing**: Routes emails to different queues based on classification confidence
-- **Web Dashboard**: Real-time monitoring of processing status and queue contents
+- **Web Dashboard**: Real-time monitoring of processing status and queue contents (including link-sourced attachment indicators)
 - **Deduplication**: Prevents duplicate PE events using intelligent hashing
 
 ## Architecture
@@ -97,12 +98,19 @@ Create the following Azure services (or use the provided Bicep templates in `/in
 - Create a Document Intelligence resource
 - Note the endpoint URL (for PDF attachment processing)
 
-### 5. Role Assignments
+### 5. Azure Storage Account
+- Create a Storage Account (for storing downloaded attachments from email links)
+- Create a blob container named `attachments`
+- Note the storage account name
+- Ensure your identity has `Storage Blob Data Contributor` role
+
+### 6. Role Assignments
 Ensure your Azure identity has the following roles:
 - **Service Bus**: `Azure Service Bus Data Sender` and `Azure Service Bus Data Receiver`
 - **Cosmos DB**: `Cosmos DB Built-in Data Contributor`
 - **Document Intelligence**: `Cognitive Services User`
 - **AI Foundry**: `Azure AI Developer`
+- **Storage Account**: `Storage Blob Data Contributor`
 
 ### Infrastructure as Code (Optional)
 Deploy all resources using Bicep:
@@ -172,6 +180,9 @@ COSMOS_DATABASE=email-processing
 
 # Azure Document Intelligence (optional - for PDF attachments)
 DOCUMENT_INTELLIGENCE_ENDPOINT=https://<your-doc-intel>.cognitiveservices.azure.com/
+
+# Azure Storage Account (for link-downloaded attachments)
+STORAGE_ACCOUNT_NAME=<your-storage-account-name>
 
 # Microsoft Graph API (optional - for direct mailbox access)
 # GRAPH_CLIENT_ID=<app-registration-client-id>
@@ -297,6 +308,21 @@ python src/peek_queue.py
 python utils/test_connectivity.py
 ```
 
+### Run Automated Tests
+```bash
+# Run all tests
+pytest
+
+# Run unit tests only
+pytest tests/unit/
+
+# Run integration tests only
+pytest tests/integration/
+
+# Run with verbose output
+pytest -v
+```
+
 ## Project Structure
 
 ```
@@ -310,6 +336,7 @@ agentic-inbox-processing/
 │   │       ├── cosmos_tools.py        # Cosmos DB operations
 │   │       ├── document_intelligence_tool.py  # PDF extraction
 │   │       ├── graph_tools.py         # Microsoft Graph API
+│   │       ├── link_download_tool.py  # Download-link detection & blob upload
 │   │       └── queue_tools.py         # Service Bus operations
 │   └── webapp/                    # FastAPI web dashboard
 │       ├── main.py                    # Dashboard application
@@ -321,12 +348,20 @@ agentic-inbox-processing/
 │   └── parameters/                   # Environment parameters
 ├── logic-apps/                    # Logic App workflows
 │   └── email-ingestion/
+├── tests/                         # Automated tests
+│   ├── unit/                          # Unit tests
+│   │   └── test_link_download_tool.py     # Link download tool tests
+│   └── integration/                   # Integration tests
+│       └── test_link_download_flow.py     # End-to-end link download flow
+├── specs/                         # Feature specifications
+│   └── 001-download-link-intake/      # Download-link intake spec
 ├── utils/                         # Utility scripts
 │   ├── diagnose.py                   # Configuration checker
 │   ├── test_connectivity.py          # Connection tests
 │   ├── purge_queues.py               # Queue maintenance
 │   └── clear_cosmos_emails.py        # Data cleanup
 ├── requirements.txt               # Python dependencies
+├── pyproject.toml                 # Project metadata & pytest config
 ├── startup.sh                     # Azure App Service startup
 ├── gunicorn.conf.py              # Production server config
 └── README.md                      # This file
@@ -370,6 +405,20 @@ PE events are deduplicated to prevent the same event from being created multiple
 | `event_type` | Type of event (Capital Call, Distribution, etc.) | Lowercase, trimmed |
 | `amount` | Transaction amount (optional) | Only digits and decimal point kept |
 | `due_date` | Due date (optional) | Extracted to `YYYY-MM` format (month precision) |
+
+## Download-Link Intake
+
+The system automatically detects download links in email bodies and downloads the referenced documents. This handles the common scenario where PE firms send emails containing links to documents hosted on portals or cloud storage instead of traditional attachments.
+
+### How It Works
+1. **URL Extraction** — Parses both plain-text and HTML email bodies for HTTP/HTTPS URLs
+2. **Document Filtering** — Only attempts downloads for URLs that appear to reference documents (`.pdf`, `.docx`, `.xlsx`, `.csv`, `.pptx`, `.txt`, `.zip`); skips social media and non-document domains
+3. **Download & Upload** — Downloads the document via HTTPS (with a 50 MB size limit) and uploads it to Azure Blob Storage at `attachments/{emailId}/{filename}`
+4. **Record Enrichment** — Updates the Cosmos DB email record with the attachment path and sets `hasAttachments` to `true`
+5. **Graceful Failures** — If a download fails (timeout, 404, auth-required, non-document content), the email is still processed normally; failures are logged for operational visibility
+
+### Dashboard Indicators
+The web dashboard shows a link icon next to attachments that were sourced from download links (vs. traditional email attachments), making it easy to identify the origin of each document.
 
 ## Troubleshooting
 

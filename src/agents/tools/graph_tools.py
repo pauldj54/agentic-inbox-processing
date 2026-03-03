@@ -196,11 +196,21 @@ class GraphAPITools:
         Returns:
             Dictionary with user_id, message_id, and other identifiers
         """
+        # Pass through attachmentPaths unchanged — may be string[] (legacy) or object[] (new)
+        raw_paths = email_body.get("attachmentPaths", [])
+        # Normalize legacy string entries to object format for downstream consumers
+        normalized_paths = []
+        for entry in raw_paths:
+            if isinstance(entry, str):
+                normalized_paths.append({"path": entry, "source": "attachment"})
+            else:
+                normalized_paths.append(entry)
+
         return {
             "user_id": email_body.get("userPrincipalName") or email_body.get("from"),
             "message_id": email_body.get("emailId") or email_body.get("messageId"),
             "has_attachments": email_body.get("hasAttachments", False),
-            "attachment_paths": email_body.get("attachmentPaths", [])
+            "attachment_paths": normalized_paths
         }
 
 

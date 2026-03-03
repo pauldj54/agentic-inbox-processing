@@ -36,6 +36,7 @@ from .tools.queue_tools import QueueTools
 from .tools.graph_tools import GraphAPITools
 from .tools.document_intelligence_tool import DocumentIntelligenceTool
 from .tools.cosmos_tools import CosmosDBTools
+from .tools.link_download_tool import LinkDownloadTool
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +108,7 @@ class EmailClassificationAgent:
         self.graph_tools = GraphAPITools()
         self.doc_intel_tool = DocumentIntelligenceTool()
         self.cosmos_tools = CosmosDBTools()
+        self.link_download_tool = LinkDownloadTool()
         
         # Agent instances (created on demand)
         self._relevance_agent = None
@@ -262,6 +264,79 @@ class EmailClassificationAgent:
             
             logger.info(f"✅ Email IS PE-relevant → proceeding to PE event classification")
             
+            # =====================================================
+            # STEP 1.5: DOWNLOAD LINKED DOCUMENTS (if any)
+            # =====================================================
+            # Detect document download links in email body, fetch them,
+            # and add to attachmentPaths as {"path": ..., "source": "link"}
+            try:
+                # Fetch full email body from Cosmos DB — the Service Bus message
+                # only contains bodyPreview (~255 chars) which may truncate URLs.
+                email_body_for_links = ""
+                cosmos_doc = self.cosmos_tools.get_email_document(email_id)
+                if cosmos_doc:
+                    email_body_for_links = cosmos_doc.get("emailBody", "")
+                if not email_body_for_links:
+                    # Fallback to Service Bus fields if Cosmos body unavailable
+                    email_body_for_links = email_data.get("bodyText", "") or email_data.get("emailBody", "")
+                link_result = await self.link_download_tool.process_email_links(
+                    email_id=email_id,
+                    email_body=email_body_for_links,
+                )
+
+                if link_result.downloaded_files:
+                    logger.info(f"📎 Downloaded {len(link_result.downloaded_files)} linked document(s)")
+                    # Merge into attachmentPaths
+                    attachment_paths = email_data.get("attachmentPaths") or []
+                    for downloaded in link_result.downloaded_files:
+                        attachment_paths.append({
+                            "path": downloaded.path,
+                            "source": "link",
+                            "url": downloaded.url,
+                            "content_type": downloaded.content_type,
+                        })
+                    email_data["attachmentPaths"] = attachment_paths
+
+                    # Update hasAttachments and attachmentsCount (plural — matches Cosmos schema)
+                    email_data["hasAttachments"] = True
+                    current_count = email_data.get("attachmentsCount", 0)
+                    if isinstance(current_count, str):
+                        try:
+                            current_count = int(current_count)
+                        except ValueError:
+                            current_count = 0
+                    email_data["attachmentsCount"] = current_count + len(link_result.downloaded_files)
+
+                if link_result.failures:
+                    logger.warning(f"⚠️ {len(link_result.failures)} link download(s) failed")
+
+                # Stash results for Cosmos DB persistence (T010)
+                email_data["_link_download_result"] = {
+                    "urls_detected": link_result.urls_detected,
+                    "urls_attempted": link_result.urls_attempted,
+                    "downloaded_count": len(link_result.downloaded_files),
+                    "failure_count": len(link_result.failures),
+                    "failures": [
+                        {
+                            "url": f.url,
+                            "error": f.error,
+                            "attempted_at": f.attempted_at,
+                            "error_type": f.error_type,
+                            "http_status": f.http_status,
+                        }
+                        for f in link_result.failures
+                    ],
+                }
+
+                self.cosmos_tools.log_classification_event(
+                    email_id=email_id,
+                    event_type="link_download_complete",
+                    details=email_data["_link_download_result"],
+                )
+            except Exception as e:
+                logger.error(f"Error during link download pre-processing: {e}", exc_info=True)
+                # Don't block email processing — continue without downloaded links
+
             # =====================================================
             # STEP 2: PROCESS ATTACHMENTS (for PE-relevant emails)
             # =====================================================
@@ -421,11 +496,14 @@ class EmailClassificationAgent:
         logger.info(f"  hasAttachments: {has_attachments}, attachmentCount: {attachment_count}")
         
         # Get attachment paths - these are CRITICAL for relevance detection
+        # Supports both legacy string[] and new object[] ({path, source}) format
         attachment_paths = email_data.get("attachmentPaths", []) or email_data.get("attachmentNames", [])
         
         # Extract just the filename from paths (Logic App may send full path like "messageId/filename.pdf")
         attachment_names = []
-        for path in attachment_paths:
+        for entry in attachment_paths:
+            # Backward-compatible: handle both string and object entries
+            path = entry.get("path") if isinstance(entry, dict) else entry
             if "/" in path:
                 # Extract filename after the last /
                 filename = path.split("/")[-1]
@@ -591,9 +669,12 @@ class EmailClassificationAgent:
         logger.info("Performing full classification...")
         
         # Get attachment names from email_data as fallback
+        # Supports both legacy string[] and new object[] ({path, source}) format
         attachment_paths = email_data.get("attachmentPaths", []) or email_data.get("attachmentNames", [])
         attachment_names = []
-        for path in attachment_paths:
+        for entry in attachment_paths:
+            # Backward-compatible: handle both string and object entries
+            path = entry.get("path") if isinstance(entry, dict) else entry
             if "/" in path:
                 filename = path.split("/")[-1]
                 attachment_names.append(filename)
@@ -672,8 +753,14 @@ class EmailClassificationAgent:
                         logger.warning(f"Failed to parse classification response as JSON. Full response: {raw_response}")
         
         # Default response if parsing fails - but try to infer from attachment names
+        # Supports both legacy string[] and new object[] ({path, source}) format
         attachment_paths = email_data.get("attachmentPaths", [])
-        attachment_names = [p.split("/")[-1] if "/" in p else p for p in attachment_paths]
+        attachment_names = [
+            (entry.get("path") if isinstance(entry, dict) else entry).split("/")[-1]
+            if "/" in (entry.get("path") if isinstance(entry, dict) else entry)
+            else (entry.get("path") if isinstance(entry, dict) else entry)
+            for entry in attachment_paths
+        ]
         
         # Improved keyword-based fallback classification with confidence boosting
         names_lower = " ".join(attachment_names).lower()

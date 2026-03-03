@@ -100,7 +100,10 @@
                                 "type": "AppendToArrayVariable",
                                 "inputs": {
                                     "name": "AttachmentPaths",
-                                    "value": "@{triggerOutputs()?['body/id']}/@{item()?['name']}"
+                                    "value": {
+                                        "path": "@{triggerOutputs()?['body/id']}/@{item()?['name']}",
+                                        "source": "attachment"
+                                    }
                                 }
                             },
                             "Increment_AttachmentsCount": {
