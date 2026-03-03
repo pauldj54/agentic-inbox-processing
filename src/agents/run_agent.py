@@ -36,6 +36,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress noisy Azure SDK credential-chain debug/info messages
+logging.getLogger("azure.identity").setLevel(logging.WARNING)
+logging.getLogger("azure.servicebus").setLevel(logging.WARNING)
+logging.getLogger("azure.core").setLevel(logging.WARNING)
+
 
 def load_environment():
     """Load environment variables from .env files."""

@@ -186,6 +186,39 @@ templates.env.filters["format_datetime"] = format_datetime
 templates.env.filters["parse_bool"] = parse_bool
 
 
+def normalize_attachments(attachment_paths) -> list[dict]:
+    """Normalize attachmentPaths to a list of {path, source} dicts.
+
+    Handles:
+      - object entries: {"path": "...", "source": "link"|"attachment"}
+      - legacy string entries: "some/path.pdf" → {"path": "...", "source": "attachment"}
+      - None / missing → []
+    """
+    if not attachment_paths:
+        return []
+    result: list[dict] = []
+    for entry in attachment_paths:
+        if isinstance(entry, dict):
+            result.append({
+                "path": entry.get("path", ""),
+                "source": entry.get("source", "attachment"),
+            })
+        elif isinstance(entry, str):
+            result.append({"path": entry, "source": "attachment"})
+    return result
+
+
+def attachment_source_icon(source: str) -> str:
+    """Return a display icon + label for an attachment source."""
+    if source == "link":
+        return "🔗 link"
+    return "📎 attachment"
+
+
+templates.env.filters["normalize_attachments"] = normalize_attachments
+templates.env.filters["attachment_source_icon"] = attachment_source_icon
+
+
 def _get_emails_from_cosmos_sync(limit: int = 20) -> list:
     """Fetch recent emails from Cosmos DB (sync)."""
     try:

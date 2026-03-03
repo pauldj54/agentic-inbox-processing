@@ -75,7 +75,29 @@ class CosmosDBTools:
             url=self.endpoint,
             credential=AsyncCredential()
         )
-    
+
+    def get_email_document(self, email_id: str) -> dict | None:
+        """Fetch an email document from Cosmos DB by ID.
+
+        Args:
+            email_id: The unique email ID (Graph API message ID).
+
+        Returns:
+            The email document dict, or None if not found.
+        """
+        with self._get_sync_client() as client:
+            database = client.get_database_client(self.database_name)
+            container = database.get_container_client(self.CONTAINER_EMAILS)
+            query = "SELECT * FROM c WHERE c.id = @emailId OR c.emailId = @emailId"
+            items = list(container.query_items(
+                query=query,
+                parameters=[{"name": "@emailId", "value": email_id}],
+                enable_cross_partition_query=True,
+            ))
+            if items:
+                return items[0]
+            return None
+
     def update_email_classification(
         self,
         email_id: str,
@@ -136,9 +158,16 @@ class CosmosDBTools:
                         "receivedAt": email_data.get("receivedAt", email_data.get("received_at", datetime.utcnow().isoformat())),
                         "hasAttachments": parse_bool(email_data.get("hasAttachments", email_data.get("has_attachments", False))),
                         "attachmentsCount": int(att_count) if att_count else 0,
+                        "attachmentPaths": email_data.get("attachmentPaths", []),
+                        "downloadFailures": [],  # Scaffold — populated by US2/T013
                         "status": "received",  # Always start with received status (partition key)
                         "createdAt": datetime.utcnow().isoformat()
                     }
+                    # Persist link download metadata if available
+                    link_result = email_data.get("_link_download_result")
+                    if link_result:
+                        doc["linkDownload"] = link_result
+                        doc["downloadFailures"] = link_result.get("failures", [])
                 else:
                     logger.warning(f"Email document not found for {email_id[:20]}... and no email_data provided. Cannot update.")
                     return None
@@ -167,6 +196,17 @@ class CosmosDBTools:
                         # Only set to 0 if document doesn't already have a value
                         doc["hasAttachments"] = parse_bool(email_data.get("hasAttachments", False))
                         doc["attachmentsCount"] = 0
+                    # Persist enriched attachmentPaths (includes link-sourced entries)
+                    enriched_paths = email_data.get("attachmentPaths")
+                    if enriched_paths is not None:
+                        doc["attachmentPaths"] = enriched_paths
+                    # Persist link download metadata and scaffold downloadFailures
+                    link_result = email_data.get("_link_download_result")
+                    if link_result:
+                        doc["linkDownload"] = link_result
+                        doc["downloadFailures"] = link_result.get("failures", [])
+                    elif "downloadFailures" not in doc:
+                        doc["downloadFailures"] = []  # Scaffold empty array
             
             # Update classification fields
             if step == "relevance":
@@ -202,7 +242,15 @@ class CosmosDBTools:
                 else:
                     doc["status"] = "needs_review"
                     doc["queue"] = "human-review"
-            
+
+                # Mark processing timestamp when final classification is written
+                doc["processedAt"] = datetime.utcnow().isoformat()
+
+            # ── Reconcile hasAttachments / attachmentsCount from actual attachmentPaths ──
+            actual_paths = doc.get("attachmentPaths") or []
+            doc["attachmentsCount"] = len(actual_paths)
+            doc["hasAttachments"] = len(actual_paths) > 0
+
             doc["updatedAt"] = datetime.utcnow().isoformat()
             
             # Since partition key is /status, changing status creates a new document

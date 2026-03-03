@@ -203,13 +203,24 @@ class QueueTools:
                 has_attachments = val == "true"
             
             # Extract attachmentPaths array - this is CRITICAL for PE classification
+            # Supports both legacy string format and new object format {path, source}
             attachment_paths = []
             attachment_paths_match = re.search(r'"attachmentPaths":\s*\[(.*?)\]', body_str, re.DOTALL)
             if attachment_paths_match:
-                paths_content = attachment_paths_match.group(1)
-                # Extract individual paths from the array
-                path_matches = re.findall(r'"([^"]+)"', paths_content)
-                attachment_paths = path_matches
+                paths_content = attachment_paths_match.group(1).strip()
+                if paths_content:
+                    # Try to detect object format: look for {"path": ...}
+                    object_matches = re.findall(
+                        r'\{\s*"path"\s*:\s*"([^"]+)"\s*,\s*"source"\s*:\s*"([^"]+)"\s*\}',
+                        paths_content
+                    )
+                    if object_matches:
+                        # New object format: [{"path": "...", "source": "..."}]
+                        attachment_paths = [{"path": m[0], "source": m[1]} for m in object_matches]
+                    else:
+                        # Legacy string format: ["path1", "path2"]
+                        path_matches = re.findall(r'"([^"]+)"', paths_content)
+                        attachment_paths = [{"path": p, "source": "attachment"} for p in path_matches]
             
             logger.warning(f"Regex extraction: hasAttachments={has_attachments}, attachmentPaths count={len(attachment_paths)}")
             if attachment_paths:

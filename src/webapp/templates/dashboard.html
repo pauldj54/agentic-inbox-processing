@@ -140,7 +140,15 @@
                                     <td class="px-4 py-3 whitespace-nowrap text-sm text-center">
                                         {% set att_count = email.attachmentsCount or 0 %}
                                         {% if email.hasAttachments|parse_bool or att_count|int > 0 %}
-                                            <span class="text-green-600" title="{{ att_count }} attachment(s)">✅ {{ att_count }}</span>
+                                            {% set attachments = email.attachmentPaths|normalize_attachments %}
+                                            {% set link_count = attachments|selectattr('source','equalto','link')|list|length %}
+                                            {% set file_count = (att_count|int) - link_count %}
+                                            <span class="text-green-600" title="{{ att_count }} attachment(s){% if link_count > 0 %} ({{ link_count }} from link){% endif %}">
+                                                ✅ {{ att_count }}
+                                            </span>
+                                            {% if link_count > 0 %}
+                                                <span class="text-xs text-blue-500 ml-1" title="{{ link_count }} from download link(s)">🔗{{ link_count }}</span>
+                                            {% endif %}
                                         {% else %}
                                             <span class="text-gray-400">—</span>
                                         {% endif %}
@@ -245,7 +253,12 @@
                                 {% set att_count = msg.body.attachmentsCount or 0 %}
                                 {% if email.hasAttachments|parse_bool or msg.body.hasAttachments|parse_bool or att_count|int > 0 %}
                                 <div class="mt-1">
+                                    {% set attachments = (email.attachmentPaths or msg.body.attachmentPaths)|normalize_attachments %}
+                                    {% set link_count = attachments|selectattr('source','equalto','link')|list|length %}
                                     <span class="text-xs text-green-600">📎 {{ att_count }} attachment(s)</span>
+                                    {% if link_count > 0 %}
+                                        <span class="text-xs text-blue-500 ml-1">🔗 {{ link_count }} from link</span>
+                                    {% endif %}
                                 </div>
                                 {% endif %}
                             </div>

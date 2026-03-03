@@ -50,12 +50,12 @@ specs/001-download-link-intake/
 ```text
 src/
 ├── agents/
-│   ├── email_classifier_agent.py   # MODIFY: add link-enrichment pre-processing step, update attachmentPaths handling
+│   ├── email_classifier_agent.py   # MODIFY: add link-download pre-processing step, update attachmentPaths handling
 │   ├── classification_prompts.py   # NO CHANGE
 │   └── tools/
 │       ├── cosmos_tools.py         # MODIFY: update attachmentPaths handling to object format
 │       ├── document_intelligence_tool.py  # NO CHANGE
-│       ├── graph_tools.py          # NO CHANGE
+│       ├── graph_tools.py          # MODIFY: pass through object-format attachmentPaths unchanged
 │       ├── queue_tools.py          # REVIEW: may need minor update for object attachmentPaths
 │       └── link_download_tool.py   # NEW: link detection, download, blob upload
 ├── webapp/
