@@ -37,13 +37,22 @@ class QueueTools:
     QUEUE_HUMAN_REVIEW = "human-review"       # Low confidence (<65%) needs disambiguation
     QUEUE_ARCHIVAL_PENDING = "archival-pending"  # Ready for archival (>=65% confidence)
     
-    def __init__(self, namespace: Optional[str] = None):
+    def __init__(
+        self,
+        namespace: Optional[str] = None,
+        triage_queue: Optional[str] = None,
+        triage_sb_namespace: Optional[str] = None,
+    ):
         """
         Initialize the Service Bus client.
         
         Args:
             namespace: Service Bus namespace (without .servicebus.windows.net).
                       If not provided, reads from SERVICEBUS_NAMESPACE env var.
+            triage_queue: Queue name for triage-complete output.
+                         Defaults to TRIAGE_COMPLETE_QUEUE env var or "triage-complete".
+            triage_sb_namespace: Optional external Service Bus namespace for triage queue.
+                               Defaults to TRIAGE_COMPLETE_SB_NAMESPACE env var.
         """
         self.namespace = namespace or os.environ.get("SERVICEBUS_NAMESPACE")
         if not self.namespace:
@@ -54,6 +63,10 @@ class QueueTools:
         
         self.fully_qualified_namespace = f"{self.namespace}.servicebus.windows.net"
         self.credential = DefaultAzureCredential()
+
+        # Triage-complete queue configuration
+        self.triage_queue = triage_queue or os.environ.get("TRIAGE_COMPLETE_QUEUE", "triage-complete")
+        self._triage_sb_namespace = triage_sb_namespace or os.environ.get("TRIAGE_COMPLETE_SB_NAMESPACE")
         
     def _get_sync_client(self) -> ServiceBusClient:
         """Get synchronous Service Bus client."""
@@ -323,6 +336,59 @@ class QueueTools:
                     content_type="application/json"
                 )
                 sender.send_messages(message)
+
+    def _get_triage_sync_client(self) -> ServiceBusClient:
+        """Get SB client for the triage queue — external namespace if set, else primary."""
+        ns = self._triage_sb_namespace or self.namespace
+        fqns = f"{ns}.servicebus.windows.net"
+        return ServiceBusClient(
+            fully_qualified_namespace=fqns,
+            credential=DefaultAzureCredential(),
+        )
+
+    def send_to_triage_queue(self, message_data: dict) -> str:
+        """
+        Send a message to the triage-complete queue.
+        Uses the external Service Bus namespace if TRIAGE_COMPLETE_SB_NAMESPACE is set,
+        otherwise uses the primary namespace.
+
+        Args:
+            message_data: Triage-complete message payload
+
+        Returns:
+            The target queue name
+
+        Raises:
+            Exception: If the send fails after dead-letter fallback attempt
+        """
+        try:
+            with self._get_triage_sync_client() as client:
+                sender = client.get_queue_sender(queue_name=self.triage_queue)
+                with sender:
+                    msg = ServiceBusMessage(
+                        body=json.dumps(message_data, default=str),
+                        content_type="application/json",
+                    )
+                    sender.send_messages(msg)
+            logger.info(f"Sent triage-complete message to {self.triage_queue}")
+            return self.triage_queue
+        except Exception as e:
+            # External namespace failure — dead-letter on primary namespace
+            target_ns = self._triage_sb_namespace or self.namespace
+            logger.error(
+                f"Failed to send to triage queue '{self.triage_queue}' on namespace "
+                f"'{target_ns}': {e}. Routing to dead-letter on primary namespace.",
+                exc_info=True,
+            )
+            dlq_message = {
+                **message_data,
+                "_deadLetterReason": "triage_queue_send_failure",
+                "_deadLetterError": str(e),
+                "_originalQueue": self.triage_queue,
+                "_originalNamespace": target_ns,
+            }
+            self._send_to_queue("dead-letter", dlq_message)
+            raise
     
     def peek_queue(self, queue_name: str, max_count: int = 10) -> List[dict]:
         """

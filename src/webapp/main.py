@@ -45,6 +45,12 @@ QUEUE_NAMES = [
     "archival-pending",  # Ready for archival (>=65%)
 ]
 
+# Add triage-complete queue only in triage-only mode AND when using primary namespace
+_triage_queue = os.environ.get("TRIAGE_COMPLETE_QUEUE", "triage-complete")
+_pipeline_mode = os.environ.get("PIPELINE_MODE", "full").strip().lower()
+if _pipeline_mode == "triage-only" and not os.environ.get("TRIAGE_COMPLETE_SB_NAMESPACE"):
+    QUEUE_NAMES.append(_triage_queue)
+
 # Global clients (initialized on startup)
 credential = None
 cosmos_client = None
@@ -344,17 +350,18 @@ async def get_queue_messages(queue_name: str, max_count: int = 10) -> list:
 
 
 def _get_pe_event_stats_sync() -> dict:
-    """Get PE event statistics (sync)."""
+    """Get PE event statistics (sync).
+    
+    Uses client-side aggregation because the Cosmos DB SDK version
+    does not support GROUP BY / multiple aggregates.
+    """
     try:
         database = cosmos_client.get_database_client(COSMOS_DATABASE)
         container = database.get_container_client("pe-events")
         
-        # Count events by type
-        query = """
-            SELECT c.eventType, COUNT(1) as count, SUM(c.emailCount) as totalEmails
-            FROM c
-            GROUP BY c.eventType
-        """
+        # Fetch all pe-events and aggregate client-side
+        # (avoids GROUP BY which requires a newer SDK gateway mode)
+        query = "SELECT c.eventType, c.emailCount FROM c"
         
         stats = {
             "byEventType": {},
@@ -368,15 +375,15 @@ def _get_pe_event_stats_sync() -> dict:
             enable_cross_partition_query=True
         ):
             event_type = item.get("eventType", "Unknown")
-            count = item.get("count", 0)
-            total_emails = item.get("totalEmails", 0)
+            email_count = item.get("emailCount", 0) or 0
             
-            stats["byEventType"][event_type] = {
-                "events": count,
-                "emails": total_emails
-            }
-            stats["totalEvents"] += count
-            stats["totalEmails"] += total_emails
+            if event_type not in stats["byEventType"]:
+                stats["byEventType"][event_type] = {"events": 0, "emails": 0}
+            
+            stats["byEventType"][event_type]["events"] += 1
+            stats["byEventType"][event_type]["emails"] += email_count
+            stats["totalEvents"] += 1
+            stats["totalEmails"] += email_count
         
         stats["duplicateEmails"] = stats["totalEmails"] - stats["totalEvents"]
         return stats
@@ -418,7 +425,8 @@ async def dashboard(request: Request):
             "emails": emails,
             "pe_stats": pe_stats,
             "queue_messages": queue_messages,
-            "queue_names": QUEUE_NAMES
+            "queue_names": QUEUE_NAMES,
+            "pipeline_mode": os.environ.get("PIPELINE_MODE", "full"),
         }
     )
 

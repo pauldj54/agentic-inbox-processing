@@ -233,7 +233,11 @@ class CosmosDBTools:
                 }
                 
                 # Determine status and queue based on 65% confidence threshold
-                if classification == "Not PE Related":
+                pipeline_mode = classification_details.get("pipelineMode", "full")
+                if pipeline_mode == "triage-only":
+                    doc["status"] = "processed"
+                    doc["queue"] = classification_details.get("targetQueue", "triage-complete")
+                elif classification == "Not PE Related":
                     doc["status"] = "discarded"
                     doc["queue"] = "discarded"
                 elif confidence_score >= 0.65:
@@ -245,6 +249,12 @@ class CosmosDBTools:
 
                 # Mark processing timestamp when final classification is written
                 doc["processedAt"] = datetime.utcnow().isoformat()
+
+            # ── Pipeline mode tracking ──
+            if "pipelineMode" in classification_details:
+                doc["pipelineMode"] = classification_details["pipelineMode"]
+            if "stepsExecuted" in classification_details:
+                doc["stepsExecuted"] = classification_details["stepsExecuted"]
 
             # ── Reconcile hasAttachments / attachmentsCount from actual attachmentPaths ──
             actual_paths = doc.get("attachmentPaths") or []

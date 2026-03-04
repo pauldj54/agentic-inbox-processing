@@ -110,6 +110,9 @@ class EmailClassificationAgent:
         self.cosmos_tools = CosmosDBTools()
         self.link_download_tool = LinkDownloadTool()
         
+        # Pipeline mode configuration
+        self.pipeline_mode = os.getenv("PIPELINE_MODE", "full")
+        
         # Agent instances (created on demand)
         self._relevance_agent = None
         self._classification_agent = None
@@ -269,6 +272,7 @@ class EmailClassificationAgent:
             # =====================================================
             # Detect document download links in email body, fetch them,
             # and add to attachmentPaths as {"path": ..., "source": "link"}
+            cosmos_doc = None  # Saved for attachment reconciliation later
             try:
                 # Fetch full email body from Cosmos DB — the Service Bus message
                 # only contains bodyPreview (~255 chars) which may truncate URLs.
@@ -337,6 +341,31 @@ class EmailClassificationAgent:
                 logger.error(f"Error during link download pre-processing: {e}", exc_info=True)
                 # Don't block email processing — continue without downloaded links
 
+            # ── Reconcile attachment info from Cosmos (authoritative source) ──
+            # The Logic App writes attachment paths to Cosmos before sending to
+            # the intake queue, so Cosmos may have richer data than the queue msg.
+            if cosmos_doc:
+                cosmos_att_paths = cosmos_doc.get("attachmentPaths") or []
+                email_att_paths = email_data.get("attachmentPaths") or []
+                if len(cosmos_att_paths) > len(email_att_paths):
+                    email_data["attachmentPaths"] = cosmos_att_paths
+                cosmos_att_count = cosmos_doc.get("attachmentsCount", 0)
+                email_att_count = email_data.get("attachmentsCount", 0)
+                if isinstance(email_att_count, str):
+                    try:
+                        email_att_count = int(email_att_count)
+                    except ValueError:
+                        email_att_count = 0
+                if isinstance(cosmos_att_count, str):
+                    try:
+                        cosmos_att_count = int(cosmos_att_count)
+                    except ValueError:
+                        cosmos_att_count = 0
+                if cosmos_att_count > email_att_count:
+                    email_data["attachmentsCount"] = cosmos_att_count
+                if cosmos_doc.get("hasAttachments") and not email_data.get("hasAttachments"):
+                    email_data["hasAttachments"] = True
+
             # =====================================================
             # STEP 2: PROCESS ATTACHMENTS (for PE-relevant emails)
             # =====================================================
@@ -349,6 +378,74 @@ class EmailClassificationAgent:
                     event_type="attachments_processed",
                     details={"attachment_count": len(attachment_analysis)}
                 )
+            
+            # =====================================================
+            # PIPELINE MODE BRANCH (after pre-processing, before classification)
+            # =====================================================
+            logger.info(f"Pipeline mode: {self.pipeline_mode} for email {email_id[:30]}")
+
+            if self.pipeline_mode == "triage-only":
+                # ── TRIAGE-ONLY: skip classification (Steps 3–5) ──
+                relevance_block = {
+                    "isRelevant": True,
+                    "confidence": relevance_result.get("confidence", 0.0),
+                    "initialCategory": relevance_result.get("initial_category", ""),
+                    "reasoning": relevance_result.get("reasoning", ""),
+                }
+                triage_message = {
+                    "emailId": email_id,
+                    "from": email_data.get("from", email_data.get("sender", "unknown")),
+                    "subject": email_data.get("subject", ""),
+                    "receivedAt": email_data.get("receivedAt", email_data.get("received_at", "")),
+                    "hasAttachments": parse_bool(email_data.get("hasAttachments", False)),
+                    "attachmentsCount": email_data.get("attachmentsCount", 0),
+                    "attachmentPaths": email_data.get("attachmentPaths", []),
+                    "relevance": relevance_block,
+                    "pipelineMode": "triage-only",
+                    "status": "triaged",
+                    "processedAt": datetime.utcnow().isoformat(),
+                    "routing": {
+                        "sourceQueue": self.queue_tools.QUEUE_EMAIL_INTAKE,
+                        "targetQueue": self.queue_tools.triage_queue,
+                        "routedAt": datetime.utcnow().isoformat(),
+                    },
+                }
+
+                triage_target = self.queue_tools.send_to_triage_queue(triage_message)
+
+                # Update Cosmos with triage-only pipeline details
+                triage_classification_details = {
+                    **relevance_result,
+                    "pipelineMode": "triage-only",
+                    "stepsExecuted": ["triage", "pre-processing", "routing"],
+                    "targetQueue": triage_target,
+                }
+                self.cosmos_tools.update_email_classification(
+                    email_id=email_id,
+                    classification=relevance_result.get("initial_category", ""),
+                    confidence_score=relevance_result.get("confidence", 0.0),
+                    classification_details=triage_classification_details,
+                    step="final",
+                    email_data=email_data,
+                )
+
+                self.cosmos_tools.log_classification_event(
+                    email_id=email_id,
+                    event_type="triage_complete",
+                    details={"pipeline_mode": "triage-only", "routed_to": triage_target},
+                )
+
+                return {
+                    "email_id": email_id,
+                    "step": "triage_only",
+                    "is_relevant": True,
+                    "category": relevance_result.get("initial_category", ""),
+                    "confidence": relevance_result.get("confidence", 0.0),
+                    "routed_to": triage_target,
+                    "pipeline_mode": "triage-only",
+                }
+
+            # ── FULL MODE: continue with classification (Steps 3–5) ──
             
             # =====================================================
             # STEP 3: PE EVENT TYPE CLASSIFICATION
@@ -367,11 +464,16 @@ class EmailClassificationAgent:
             )
             
             # Update email with final classification
+            full_classification_details = {
+                **classification_result,
+                "pipelineMode": "full",
+                "stepsExecuted": ["triage", "pre-processing", "classification", "routing"],
+            }
             self.cosmos_tools.update_email_classification(
                 email_id=email_id,
                 classification=classification_result.get("category", "Capital Call"),  # Default to Capital Call for PE emails
                 confidence_score=classification_result.get("confidence", 0.0),
-                classification_details=classification_result,
+                classification_details=full_classification_details,
                 step="final",
                 email_data=email_data
             )

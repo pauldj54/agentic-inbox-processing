@@ -14,6 +14,7 @@ An intelligent email classification system for Private Equity (PE) lifecycle eve
 - [Testing](#testing)
 - [Project Structure](#project-structure)
 - [PE Event Categories](#pe-event-categories)
+- [Pipeline Configuration](#pipeline-configuration)
 - [Troubleshooting](#troubleshooting)
 
 ## Overview
@@ -25,7 +26,8 @@ This solution provides:
 - **Download-Link Intake**: Detects download links in email bodies, downloads the documents, and stores them in Azure Blob Storage using the same convention as regular attachments
 - **Entity Extraction**: Automatically extracts fund names, PE company names, amounts, and dates
 - **Confidence-based Routing**: Routes emails to different queues based on classification confidence
-- **Web Dashboard**: Real-time monitoring of processing status and queue contents (including link-sourced attachment indicators)
+- **Pipeline Configuration**: Switch between full classification pipeline and triage-only mode via environment variable
+- **Web Dashboard**: Real-time monitoring of processing status, queue contents, pipeline mode indicator, and link-sourced attachment indicators
 - **Deduplication**: Prevents duplicate PE events using intelligent hashing
 
 ## Architecture
@@ -41,22 +43,32 @@ This solution provides:
                                               │  (Azure AI Agent Service)       │
                                               │                                 │
                                               │  Step 1: Relevance Check        │
-                                              │  Step 2: Full Classification    │
-                                              │  Step 3: Entity Extraction      │
+                                              │  Step 2: Route by Pipeline Mode │
                                               └─────────────┬───────────────────┘
                                                             │
-                           ┌────────────────────────────────┼────────────────────────────────┐
-                           │                                │                                │
-                           ▼                                ▼                                ▼
-              ┌─────────────────────┐        ┌─────────────────────┐        ┌─────────────────────┐
-              │  discarded          │        │  archival-pending   │        │  human-review       │
-              │  (Not PE related)   │        │  (≥65% confidence)  │        │  (<65% confidence)  │
-              └─────────────────────┘        └─────────────────────┘        └─────────────────────┘
-                                                            │
-                                                            ▼
-                                              ┌─────────────────────────────────┐
-                                              │  Cosmos DB (Audit & Storage)    │
-                                              └─────────────────────────────────┘
+                                         ┌──────────────────┴──────────────────┐
+                                         │                                     │
+                                    PIPELINE_MODE                         PIPELINE_MODE
+                                      = "full"                            = "triage-only"
+                                         │                                     │
+                                         ▼                                     ▼
+                              ┌─────────────────────┐           ┌─────────────────────────┐
+                              │  Step 3: Classify    │           │  Send to triage-complete │
+                              │  Step 4: Extract     │           │  queue (skip classify)   │
+                              └──────────┬──────────┘           └────────────┬────────────┘
+                                         │                                   │
+          ┌──────────────────────────────┼────────────────────┐              ▼
+          │                              │                    │   ┌─────────────────────┐
+          ▼                              ▼                    ▼   │  triage-complete     │
+┌─────────────────────┐   ┌─────────────────────┐  ┌────────────┐│  (for IDP / downstream)│
+│  discarded          │   │  archival-pending   │  │human-review││                       │
+│  (Not PE related)   │   │  (≥65% confidence)  │  │(<65% conf.)│└───────────────────────┘
+└─────────────────────┘   └─────────────────────┘  └────────────┘
+                                         │
+                                         ▼
+                              ┌─────────────────────────────────┐
+                              │  Cosmos DB (Audit & Storage)    │
+                              └─────────────────────────────────┘
 ```
 
 ## Prerequisites
@@ -85,6 +97,7 @@ Create the following Azure services (or use the provided Bicep templates in `/in
   - `discarded` - Non-PE emails
   - `human-review` - Low confidence classifications
   - `archival-pending` - Successfully classified emails
+  - `triage-complete` - Triage-only mode output (for IDP / downstream systems)
 
 ### 3. Azure Cosmos DB
 - Create a Cosmos DB account (NoSQL API)
@@ -188,6 +201,11 @@ STORAGE_ACCOUNT_NAME=<your-storage-account-name>
 # GRAPH_CLIENT_ID=<app-registration-client-id>
 # GRAPH_CLIENT_SECRET=<app-registration-client-secret>
 # GRAPH_TENANT_ID=<your-tenant-id>
+
+# Pipeline Configuration
+PIPELINE_MODE=full                        # "full" (default) or "triage-only"
+TRIAGE_COMPLETE_QUEUE=triage-complete      # Queue name for triage-only output
+# TRIAGE_COMPLETE_SB_NAMESPACE=<external>  # Optional: external Service Bus namespace
 ```
 
 ### Step 2: Validate Configuration
@@ -220,8 +238,9 @@ python -m uvicorn src.webapp.main:app --reload --port 8000
 Open your browser to: http://127.0.0.1:8000
 
 The dashboard shows:
-- Emails in each queue (intake, discarded, human-review, archival-pending)
-- Processed emails from Cosmos DB
+- Active pipeline mode indicator (Full Pipeline / Triage Only badge)
+- Emails in each queue (intake, discarded, human-review, archival-pending, triage-complete)
+- Processed emails from Cosmos DB with per-email pipeline status
 - Classification results and confidence scores
 
 ### Option 2: Email Classification Agent
@@ -350,11 +369,13 @@ agentic-inbox-processing/
 │   └── email-ingestion/
 ├── tests/                         # Automated tests
 │   ├── unit/                          # Unit tests
-│   │   └── test_link_download_tool.py     # Link download tool tests
+│   │   ├── test_link_download_tool.py     # Link download tool tests
+│   │   └── test_pipeline_config.py        # Pipeline mode tests
 │   └── integration/                   # Integration tests
 │       └── test_link_download_flow.py     # End-to-end link download flow
 ├── specs/                         # Feature specifications
-│   └── 001-download-link-intake/      # Download-link intake spec
+│   ├── 001-download-link-intake/      # Download-link intake spec
+│   └── 002-pipeline-config/           # Pipeline configuration spec
 ├── utils/                         # Utility scripts
 │   ├── diagnose.py                   # Configuration checker
 │   ├── test_connectivity.py          # Connection tests
@@ -393,6 +414,7 @@ The system classifies emails into these Private Equity lifecycle events:
 | `discarded` | Non-PE related emails | Not PE Related classification |
 | `archival-pending` | Successfully classified emails | Confidence ≥ 65% |
 | `human-review` | Uncertain classifications | Confidence < 65% |
+| `triage-complete` | Triage-only mode output | `PIPELINE_MODE=triage-only` |
 
 ## PE Event Deduplication
 
@@ -419,6 +441,49 @@ The system automatically detects download links in email bodies and downloads th
 
 ### Dashboard Indicators
 The web dashboard shows a link icon next to attachments that were sourced from download links (vs. traditional email attachments), making it easy to identify the origin of each document.
+
+## Pipeline Configuration
+
+The agent supports two pipeline modes, controlled by the `PIPELINE_MODE` environment variable:
+
+| Mode | Value | Behavior |
+|------|-------|----------|
+| **Full Pipeline** | `full` (default) | Relevance check → Classification → Entity extraction → Confidence-based routing |
+| **Triage Only** | `triage-only` | Relevance check only → Forward to `triage-complete` queue for downstream processing |
+
+### When to Use Each Mode
+
+- **Full Pipeline (`full`)** — The agent handles end-to-end classification and routing. Emails are classified into PE event categories, entities are extracted, and the email is routed to `archival-pending`, `human-review`, or `discarded` based on confidence.
+- **Triage Only (`triage-only`)** — The agent performs the initial relevance check (PE-related vs. not) and stops. PE-relevant emails are placed on the `triage-complete` queue for consumption by an external system (e.g., an IDP platform). Non-PE emails are still routed to `discarded`. Classification and entity extraction are skipped.
+
+### Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `PIPELINE_MODE` | No | `full` | `full` or `triage-only` |
+| `TRIAGE_COMPLETE_QUEUE` | No | `triage-complete` | Queue name for triage-only output |
+| `TRIAGE_COMPLETE_SB_NAMESPACE` | No | *(unset)* | Optional external Service Bus namespace. If unset, the primary namespace is used. |
+
+### Integration Pattern
+
+The recommended integration model is **pull**: the downstream system (e.g., IDP) reads from the `triage-complete` queue on your primary Service Bus namespace using shared-access or RBAC credentials. This avoids cross-namespace authentication complexity.
+
+If push to an external namespace is needed, set `TRIAGE_COMPLETE_SB_NAMESPACE` to the target FQDN. The agent will authenticate via `DefaultAzureCredential` and includes dead-letter fallback if the external send fails.
+
+### Cosmos DB Fields
+
+When pipeline mode is active, each processed email record in Cosmos DB includes:
+
+| Field | Example (`full`) | Example (`triage-only`) |
+|-------|-------------------|--------------------------|
+| `pipelineMode` | `"full"` | `"triage-only"` |
+| `stepsExecuted` | `["relevance","classification","extraction"]` | `["relevance"]` |
+
+### Dashboard Indicators
+
+- A **pipeline mode badge** is displayed in the dashboard header ("Full Pipeline" or "Triage Only")
+- Emails processed in triage-only mode show a "Skipped (triage-only)" label in the status column
+- The `triage-complete` queue appears in the queue monitor when using the primary namespace
 
 ## Troubleshooting
 
