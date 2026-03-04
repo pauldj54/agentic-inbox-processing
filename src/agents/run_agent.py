@@ -75,6 +75,29 @@ def load_environment():
             logger.info(f"  - {var}")
         sys.exit(1)
 
+    # ── Pipeline mode configuration (optional — defaults to "full") ──
+    VALID_PIPELINE_MODES = {"full", "triage-only"}
+    raw_mode = os.getenv("PIPELINE_MODE")
+    if raw_mode is None:
+        logger.warning("PIPELINE_MODE not set. Defaulting to 'full' (full-pipeline mode).")
+        os.environ["PIPELINE_MODE"] = "full"
+    else:
+        pipeline_mode = raw_mode.strip().lower()
+        if pipeline_mode not in VALID_PIPELINE_MODES:
+            logger.error(
+                f"Invalid PIPELINE_MODE '{raw_mode}'. "
+                f"Valid: {VALID_PIPELINE_MODES}. Defaulting to 'full'."
+            )
+            os.environ["PIPELINE_MODE"] = "full"
+        else:
+            os.environ["PIPELINE_MODE"] = pipeline_mode
+
+    # Triage-complete queue name (default: "triage-complete")
+    if not os.getenv("TRIAGE_COMPLETE_QUEUE"):
+        os.environ["TRIAGE_COMPLETE_QUEUE"] = "triage-complete"
+
+    # Optional external Service Bus namespace for triage-complete queue (no default)
+
 
 async def run_agent_loop(max_emails: int = None, once: bool = False):
     """
@@ -180,6 +203,11 @@ Examples:
     logger.info(f"  Cosmos DB: {os.getenv('COSMOS_ENDPOINT')}")
     logger.info(f"  Document Intelligence: {os.getenv('DOCUMENT_INTELLIGENCE_ENDPOINT')}")
     logger.info(f"  AI Project: {os.getenv('AZURE_AI_PROJECT_ENDPOINT')}")
+    logger.info(f"  Pipeline Mode: {os.getenv('PIPELINE_MODE', 'full')}")
+    logger.info(f"  Triage Queue: {os.getenv('TRIAGE_COMPLETE_QUEUE', 'triage-complete')}")
+    triage_ns = os.getenv("TRIAGE_COMPLETE_SB_NAMESPACE")
+    if triage_ns:
+        logger.info(f"  Triage SB Namespace: {triage_ns} (external)")
     logger.info(f"  Mode: {'Once' if args.once else 'Continuous'}")
     if args.max_emails:
         logger.info(f"  Max Emails: {args.max_emails}")

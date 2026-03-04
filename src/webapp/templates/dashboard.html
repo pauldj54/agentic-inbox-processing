@@ -26,9 +26,13 @@
         .status-failed { background-color: #FDE7E9; color: #D13438; }
         .status-pending { background-color: #F3F2F1; color: #605E5C; }
         .status-classified { background-color: #DFF6DD; color: #107C10; }
+        .status-processed { background-color: #E5F1FB; color: #0078D4; }
         .status-discarded { background-color: #F3F2F1; color: #605E5C; }
         .status-needs_review { background-color: #FFF4CE; color: #8A6914; }
         .badge-duplicate { background-color: #FCE8E8; color: #C53030; }
+        .badge-pipeline-full { background-color: #DFF6DD; color: #107C10; }
+        .badge-pipeline-triage { background-color: #FFF4CE; color: #8A6914; }
+        .badge-triage-queue { background-color: #E5F1FB; color: #0078D4; }
     </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -39,6 +43,9 @@
                 <div>
                     <h1 class="text-2xl font-bold">📧 Email Processing Dashboard</h1>
                     <p class="text-blue-100 text-sm">Zava PE Document Automation</p>
+                    <span class="mt-1 inline-block px-2 py-0.5 text-xs font-medium rounded-full {% if pipeline_mode == 'triage-only' %}badge-pipeline-triage{% else %}badge-pipeline-full{% endif %}">
+                        {% if pipeline_mode == 'triage-only' %}⚡ Triage Only{% else %}🔄 Full Pipeline{% endif %}
+                    </span>
                 </div>
                 <div class="flex items-center gap-4">
                     <div class="text-right text-sm">
@@ -118,12 +125,20 @@
                                 <tr class="hover:bg-gray-50 {% if email.isDuplicate %}bg-orange-50{% endif %}">
                                     <td class="px-4 py-3 whitespace-nowrap">
                                         <div class="flex flex-col gap-1">
-                                            <span class="px-2 py-1 text-xs font-medium rounded-full status-{{ email.status|default('pending') }}">
-                                                {{ email.status|default('pending')|upper }}
+                                            {% set display_status = 'processed' if email.pipelineMode == 'triage-only' else email.status|default('pending') %}
+                                            <span class="px-2 py-1 text-xs font-medium rounded-full status-{{ display_status }}">
+                                                {{ display_status|upper }}
                                             </span>
                                             {% if email.isDuplicate %}
                                             <span class="px-2 py-0.5 text-xs font-medium rounded-full badge-duplicate">
                                                 🔁 DUPLICATE
+                                            </span>
+                                            {% endif %}
+                                            {% set mode = email.pipelineMode|default('full') %}
+                                            {% set steps = email.stepsExecuted|default([]) %}
+                                            {% if mode == 'triage-only' or (steps and 'classification' not in steps) %}
+                                            <span class="px-2 py-0.5 text-xs font-medium rounded-full badge-triage-queue">
+                                                📬 Triage queue
                                             </span>
                                             {% endif %}
                                         </div>
