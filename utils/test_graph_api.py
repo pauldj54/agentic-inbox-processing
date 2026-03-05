@@ -38,18 +38,10 @@ def check_environment():
     graph_client_secret = os.environ.get("GRAPH_CLIENT_SECRET")
     graph_tenant_id = os.environ.get("GRAPH_TENANT_ID")
     
-    # Fallback to ENTRA credentials
-    entra_client_id = os.environ.get("ENTRA_CLIENT_ID")
-    entra_tenant_id = os.environ.get("ENTRA_TENANT_ID")
-    
     print(f"\nGraph API Credentials:")
     print(f"  GRAPH_CLIENT_ID:     {'✅ Set' if graph_client_id else '❌ Not set'}")
     print(f"  GRAPH_CLIENT_SECRET: {'✅ Set' if graph_client_secret else '❌ Not set'}")
     print(f"  GRAPH_TENANT_ID:     {'✅ Set' if graph_tenant_id else '❌ Not set'}")
-    
-    print(f"\nEntra ID Credentials (fallback):")
-    print(f"  ENTRA_CLIENT_ID:     {'✅ Set' if entra_client_id else '❌ Not set'} ({entra_client_id if entra_client_id else 'N/A'})")
-    print(f"  ENTRA_TENANT_ID:     {'✅ Set' if entra_tenant_id else '❌ Not set'} ({entra_tenant_id if entra_tenant_id else 'N/A'})")
     
     if graph_client_id and graph_client_secret and graph_tenant_id:
         print("\n✅ Using ClientSecretCredential (App Registration)")
@@ -57,7 +49,7 @@ def check_environment():
     else:
         print("\n⚠️  Graph credentials not fully set. Will try DefaultAzureCredential.")
         print("   This may not work for accessing other users' mailboxes.")
-        return "default", None, None, entra_tenant_id or graph_tenant_id
+        return "default", None, None, graph_tenant_id
 
 
 async def get_token_client_secret(client_id: str, client_secret: str, tenant_id: str) -> str:
