@@ -114,6 +114,8 @@ module webApp 'modules/web-app.bicep' = {
     storageAccountName: storage.outputs.name
     serviceBusNamespace: serviceBus.outputs.namespaceName
     documentIntelligenceEndpoint: documentIntelligence.outputs.endpoint
+    authClientId: '9a517e48-aa49-4af4-82b0-34c7587841c4'
+    authTenantId: tenant().tenantId
   }
 }
 

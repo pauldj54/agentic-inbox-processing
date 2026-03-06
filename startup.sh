@@ -4,6 +4,9 @@
 
 cd /home/site/wwwroot
 
+# Ensure the app root is on Python's module path
+export PYTHONPATH="/home/site/wwwroot:$PYTHONPATH"
+
 # Install dependencies if needed
 pip install -r requirements.txt
 
