@@ -15,6 +15,8 @@ An intelligent email classification system for Private Equity (PE) lifecycle eve
 - [Project Structure](#project-structure)
 - [PE Event Categories](#pe-event-categories)
 - [Pipeline Configuration](#pipeline-configuration)
+- [Authentication (Entra ID Easy Auth)](#authentication-entra-id-easy-auth)
+- [Deploying to Azure](#deploying-to-azure)
 - [Troubleshooting](#troubleshooting)
 
 ## Overview
@@ -484,6 +486,261 @@ When pipeline mode is active, each processed email record in Cosmos DB includes:
 - A **pipeline mode badge** is displayed in the dashboard header ("Full Pipeline" or "Triage Only")
 - Emails processed in triage-only mode show a "Skipped (triage-only)" label in the status column
 - The `triage-complete` queue appears in the queue monitor when using the primary namespace
+
+## Authentication (Entra ID Easy Auth)
+
+The web dashboard is protected by **Azure App Service Easy Auth** (also known as built-in authentication) using **Microsoft Entra ID** (formerly Azure AD). This means authentication is handled at the platform level — the application code itself does not implement any login logic.
+
+### How It Works
+
+```
+┌─────────────┐      ┌─────────────────────────┐      ┌──────────────────┐
+│   Browser   │─────▶│  App Service Easy Auth  │─────▶│  FastAPI App     │
+│             │      │  (authentication layer)  │      │  (dashboard)     │
+│             │◀─────│                           │◀─────│                  │
+└─────────────┘      └────────┬──────────────────┘      └──────────────────┘
+                              │
+                              ▼
+                     ┌──────────────────┐
+                     │  Microsoft       │
+                     │  Entra ID        │
+                     │  (login.ms.com)  │
+                     └──────────────────┘
+```
+
+1. A user navigates to the App Service URL.
+2. App Service intercepts the request **before** it reaches the FastAPI app.
+3. If the user is not authenticated, they are redirected to the Microsoft Entra ID login page.
+4. After successful login, Entra ID issues a token and redirects back to the App Service.
+5. App Service validates the token and forwards the request to the FastAPI app with authentication headers.
+6. The app never handles credentials — it only sees pre-authenticated requests.
+
+### Key Configuration
+
+Authentication is configured via `authsettingsV2` on the App Service resource:
+
+| Setting | Value | Purpose |
+|---------|-------|---------|
+| `platform.enabled` | `true` | Enables the authentication layer |
+| `requireAuthentication` | `true` | All requests must be authenticated |
+| `unauthenticatedClientAction` | `RedirectToLoginPage` | Unauthenticated users are redirected to login |
+| `redirectToProvider` | `azureActiveDirectory` | Uses Entra ID as the identity provider |
+| `openIdIssuer` | `https://login.microsoftonline.com/{tenantId}/v2.0` | Tenant-specific token issuer |
+| `clientId` | App Registration client ID | Identifies the app to Entra ID |
+| `allowedAudiences` | `[clientId]` | Validates token audience (must be the client ID without `api://` prefix) |
+| `tokenStore.enabled` | `true` | Stores session tokens server-side |
+
+### Entra ID App Registration
+
+Easy Auth requires an **App Registration** in Microsoft Entra ID. This is a one-time setup:
+
+1. **Create the App Registration** (Azure Portal → Entra ID → App registrations → New registration):
+   - **Name**: e.g., `app-docproc-dev-dashboard`
+   - **Supported account types**: Single tenant (this organization only)
+   - **Redirect URI**: `https://<your-app-name>.azurewebsites.net/.auth/login/aad/callback` (type: Web)
+
+2. **Enable ID tokens**: Go to Authentication → check "ID tokens" under Implicit grant
+
+3. **Create a Service Principal** (if not auto-created):
+   ```bash
+   az ad sp create --id <appId>
+   ```
+
+4. **Note the Application (client) ID** — this is used as both `clientId` and `allowedAudiences` in the auth config.
+
+### Infrastructure as Code
+
+The authentication configuration is defined in Bicep at [infrastructure/modules/web-app.bicep](infrastructure/modules/web-app.bicep):
+
+```bicep
+resource authSettings 'Microsoft.Web/sites/config@2023-12-01' = {
+  parent: webApp
+  name: 'authsettingsV2'
+  properties: {
+    platform: { enabled: true }
+    globalValidation: {
+      requireAuthentication: true
+      unauthenticatedClientAction: 'RedirectToLoginPage'
+      redirectToProvider: 'azureActiveDirectory'
+    }
+    identityProviders: {
+      azureActiveDirectory: {
+        enabled: true
+        registration: {
+          openIdIssuer: '${environment().authentication.loginEndpoint}${authTenantId}/v2.0'
+          clientId: authClientId
+        }
+        validation: {
+          allowedAudiences: [ authClientId ]
+        }
+      }
+    }
+    login: { tokenStore: { enabled: true } }
+  }
+}
+```
+
+The `authClientId` and `authTenantId` are passed as parameters from [infrastructure/main.bicep](infrastructure/main.bicep).
+
+### Common Auth Pitfalls
+
+| Issue | Symptom | Fix |
+|-------|---------|-----|
+| Missing Service Principal | Login page shows `AADSTS700016` error | Run `az ad sp create --id <appId>` |
+| ID tokens not enabled | Login redirects but fails | Enable "ID tokens" in App Registration → Authentication |
+| Wrong audience format | `401 Unauthorized` after login | Use the client ID directly (e.g., `9a517e48-...`), NOT `api://9a517e48-...` |
+| Multiple identity providers | Unexpected redirect or `500` errors | Remove all providers except `azureActiveDirectory` from `authsettingsV2` |
+| Startup command not set | Container crashes with exit code 3 | Set via ARM REST API (see Deployment section) |
+
+### Auth Endpoints
+
+Once Easy Auth is enabled, these endpoints are available automatically:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `/.auth/login/aad` | Initiates Entra ID login |
+| `/.auth/login/aad/callback` | OAuth callback (redirect URI) |
+| `/.auth/me` | Returns the authenticated user's claims (JSON) |
+| `/.auth/logout` | Signs out the user |
+
+---
+
+## Deploying to Azure
+
+This section provides step-by-step instructions for deploying the application to Azure App Service.
+
+### Prerequisites
+
+- **Azure CLI** installed and authenticated (`az login`)
+- An **Azure subscription** with permissions to create resources
+- An **Entra ID App Registration** (see [Authentication](#authentication-entra-id-easy-auth) section)
+
+### Step 1: Provision Infrastructure
+
+Deploy all Azure resources using the provided Bicep templates:
+
+```bash
+# Login and set subscription
+az login
+az account set --subscription "<subscription-id>"
+
+# Create resource group
+az group create --name rg-docproc-dev --location westeurope
+
+# Deploy infrastructure (creates all resources + role assignments)
+az deployment group create \
+  --resource-group rg-docproc-dev \
+  --template-file infrastructure/main.bicep \
+  --parameters infrastructure/parameters/dev.bicepparam
+```
+
+This creates: App Service Plan, Web App, Cosmos DB, Service Bus, Storage Account, Document Intelligence, Log Analytics, Logic App, and all RBAC role assignments.
+
+### Step 2: Add Required App Settings
+
+After infrastructure provisioning, add the app settings that map to the variable names the application code expects:
+
+```bash
+APP_NAME="<your-app-name>"   # e.g., app-docproc-dev-izr2ch55woa3c
+RG="rg-docproc-dev"
+
+az webapp config appsettings set \
+  --resource-group $RG --name $APP_NAME \
+  --settings \
+    COSMOS_ENDPOINT="https://<cosmos-account>.documents.azure.com:443/" \
+    SERVICEBUS_NAMESPACE="<servicebus-name>" \
+    PIPELINE_MODE="triage-only" \
+    PYTHONPATH="/home/site/wwwroot"
+```
+
+> **Note**: The Bicep templates create `COSMOS_DB_ENDPOINT` and `SERVICE_BUS_NAMESPACE`, but the application code expects `COSMOS_ENDPOINT` and `SERVICEBUS_NAMESPACE`. Add both naming variants to avoid `KeyError` crashes.
+
+### Step 3: Set the Startup Command
+
+The startup command **must be set via the ARM REST API** because `az webapp config set --startup-file` silently fails for Python Linux apps:
+
+```bash
+APP_NAME="<your-app-name>"
+RG="rg-docproc-dev"
+SUB_ID="<subscription-id>"
+
+az rest --method PATCH \
+  --url "https://management.azure.com/subscriptions/$SUB_ID/resourceGroups/$RG/providers/Microsoft.Web/sites/$APP_NAME?api-version=2023-12-01" \
+  --body '{"properties":{"siteConfig":{"appCommandLine":"gunicorn src.webapp.main:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000"}}}'
+```
+
+> **Why ARM REST API?** Azure CLI's `--startup-file` flag for Python apps has a known issue where it appears to succeed but doesn't persist the value. Using the ARM REST API with `appCommandLine` is reliable.
+
+### Step 4: Deploy Application Code
+
+Package and deploy the application code as a zip:
+
+```powershell
+# PowerShell
+Compress-Archive -Path src, utils, requirements.txt, startup.sh, pyproject.toml -DestinationPath deploy.zip -Force
+
+az webapp deploy `
+  --resource-group rg-docproc-dev `
+  --name <your-app-name> `
+  --src-path deploy.zip `
+  --type zip `
+  --async true
+```
+
+```bash
+# Bash
+zip -r deploy.zip src/ utils/ requirements.txt startup.sh pyproject.toml
+
+az webapp deploy \
+  --resource-group rg-docproc-dev \
+  --name <your-app-name> \
+  --src-path deploy.zip \
+  --type zip \
+  --async true
+```
+
+> **Important**: The App Service uses Oryx build system with `SCM_DO_BUILD_DURING_DEPLOYMENT=true`. This means `pip install -r requirements.txt` runs automatically during deployment. The built app is served from `/tmp/<hash>/`, not `/home/site/wwwroot/` — do NOT use `--chdir` in the startup command.
+
+### Step 5: Verify Deployment
+
+```bash
+# Check the app is running
+az webapp show --resource-group rg-docproc-dev --name <your-app-name> \
+  --query "{state:state, url:defaultHostName}" -o table
+
+# Check for startup errors in the logs
+az webapp log tail --resource-group rg-docproc-dev --name <your-app-name> --timeout 30
+
+# Test the endpoint (should return 302 redirect to login, or 401 if Easy Auth is enabled)
+curl -s -o /dev/null -w "HTTP_STATUS=%{http_code}" "https://<your-app-name>.azurewebsites.net/"
+```
+
+A `302` (redirect to login) or `401` response confirms the app is running and Easy Auth is active. Open the URL in a browser to sign in with your Entra ID credentials and access the dashboard.
+
+### Step 6: Subsequent Deployments
+
+For code-only updates (no infrastructure changes), repeat Steps 4 and 5:
+
+```powershell
+# Quick redeploy (PowerShell)
+Compress-Archive -Path src, utils, requirements.txt, startup.sh, pyproject.toml -DestinationPath deploy.zip -Force
+az webapp deploy --resource-group rg-docproc-dev --name <your-app-name> --src-path deploy.zip --type zip --async true
+Remove-Item deploy.zip
+```
+
+### Deployment Checklist
+
+| Step | Action | Verification |
+|------|--------|-------------|
+| 1 | Provision infrastructure with Bicep | `az deployment group show` returns `Succeeded` |
+| 2 | Create Entra ID App Registration | App appears in Azure Portal → Entra ID → App registrations |
+| 3 | Add app settings (`COSMOS_ENDPOINT`, `SERVICEBUS_NAMESPACE`, etc.) | `az webapp config appsettings list` shows all settings |
+| 4 | Set startup command via ARM REST API | `az webapp show --query siteConfig.appCommandLine` returns the gunicorn command |
+| 5 | Deploy code as zip | `az webapp deploy` completes without errors |
+| 6 | Verify app is running | Browser shows Entra ID login → dashboard after sign-in |
+| 7 | Set `PIPELINE_MODE` | `az webapp config appsettings list` shows `PIPELINE_MODE=full` or `triage-only` |
+
+---
 
 ## Troubleshooting
 

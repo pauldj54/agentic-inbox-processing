@@ -35,6 +35,12 @@ param serviceBusNamespace string
 @description('Document Intelligence endpoint')
 param documentIntelligenceEndpoint string = ''
 
+@description('Entra ID App Registration client ID for Easy Auth')
+param authClientId string
+
+@description('Entra ID tenant ID for Easy Auth')
+param authTenantId string
+
 // ============================================================================
 // Resources
 // ============================================================================
@@ -86,14 +92,13 @@ resource webApp 'Microsoft.Web/sites@2023-12-01' = {
           name: 'WEBSITE_RUN_FROM_PACKAGE'
           value: '0'
         }
-        // Azure AD / Entra ID settings (to be configured)
         {
           name: 'AZURE_TENANT_ID'
-          value: '' // Configure after deployment
+          value: authTenantId
         }
         {
           name: 'AZURE_CLIENT_ID'
-          value: '' // Configure after deployment
+          value: authClientId
         }
       ]
     }
@@ -105,19 +110,25 @@ resource authSettings 'Microsoft.Web/sites/config@2023-12-01' = {
   parent: webApp
   name: 'authsettingsV2'
   properties: {
+    platform: {
+      enabled: true
+    }
     globalValidation: {
       requireAuthentication: true
       unauthenticatedClientAction: 'RedirectToLoginPage'
+      redirectToProvider: 'azureActiveDirectory'
     }
     identityProviders: {
       azureActiveDirectory: {
         enabled: true
         registration: {
-          openIdIssuer: '${environment().authentication.loginEndpoint}common/v2.0'
-          clientId: '' // Configure after App Registration
+          openIdIssuer: '${environment().authentication.loginEndpoint}${authTenantId}/v2.0'
+          clientId: authClientId
         }
         validation: {
-          allowedAudiences: []
+          allowedAudiences: [
+            authClientId
+          ]
         }
       }
     }
