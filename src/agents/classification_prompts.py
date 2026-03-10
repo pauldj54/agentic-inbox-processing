@@ -310,6 +310,32 @@ FULL_CLASSIFICATION_USER_PROMPT = """Please classify this PE-related email into 
 Based on ALL the information above (especially the attachment content), provide your classification."""
 
 
+# SFTP-sourced classification prompt — omits email-specific context
+SFTP_CLASSIFICATION_USER_PROMPT = """Please classify this PE-related document into one of the 10 PE event categories:
+
+## Source
+**Intake channel:** SFTP file intake
+**Filename:** {original_filename}
+**File type:** {file_type}
+**Received date:** {received_date}
+
+## Filename Metadata
+**Account:** {account}
+**Fund:** {fund}
+**Document type (from filename):** {doc_type}
+**Name:** {name}
+**Published date:** {published_date}
+**Effective date:** {effective_date}
+
+## Attachment Analysis (PRIMARY EVIDENCE)
+{attachment_analysis}
+
+---
+
+Based on the document content above and the filename metadata, provide your classification.
+Note: This document was received via SFTP (no email context available). Rely on the PDF content and filename metadata for classification."""
+
+
 # Structured output schemas for classification
 RELEVANCE_OUTPUT_SCHEMA = {
     "type": "object",

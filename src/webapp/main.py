@@ -229,7 +229,7 @@ def _get_emails_from_cosmos_sync(limit: int = 20) -> list:
     """Fetch recent emails from Cosmos DB (sync)."""
     try:
         database = cosmos_client.get_database_client(COSMOS_DATABASE)
-        container = database.get_container_client("emails")
+        container = database.get_container_client("intake-records")
         
         query = """
             SELECT TOP @limit *
@@ -243,6 +243,8 @@ def _get_emails_from_cosmos_sync(limit: int = 20) -> list:
             parameters=[{"name": "@limit", "value": limit}],
             enable_cross_partition_query=True
         ):
+            if "intakeSource" not in item:
+                item["intakeSource"] = "email"
             emails.append(item)
         
         return emails

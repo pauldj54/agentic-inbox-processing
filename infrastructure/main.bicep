@@ -27,6 +27,13 @@ param tags object = {
   managedBy: 'bicep'
 }
 
+// Key Vault
+@description('Name of the Key Vault (must be globally unique, 3-24 chars)')
+param keyVaultName string
+
+@description('Location for the SFTP Logic App (may differ from resource group location)')
+param sftpLogicAppLocation string = resourceGroup().location
+
 // ============================================================================
 // Variables
 // ============================================================================
@@ -53,6 +60,16 @@ module storage 'modules/storage-account.bicep' = {
   name: 'storage-deployment'
   params: {
     name: 'st${baseName}${environment}${shortSuffix}'
+    location: resourceGroup().location
+    tags: tags
+  }
+}
+
+// Key Vault (secrets for SFTP, SharePoint, etc.)
+module keyVault 'modules/key-vault.bicep' = {
+  name: 'key-vault-deployment'
+  params: {
+    name: keyVaultName
     location: resourceGroup().location
     tags: tags
   }
@@ -136,8 +153,35 @@ module roleAssignments 'modules/role-assignments.bicep' = {
   name: 'role-assignments-deployment'
   params: {
     logicAppPrincipalId: logicApp.outputs.principalId
+    sftpLogicAppPrincipalId: sftpLogicApp.outputs.principalId
     storageAccountName: storage.outputs.name
     serviceBusNamespaceName: serviceBus.outputs.namespaceName
+    cosmosDbAccountName: cosmosDb.outputs.name
+  }
+}
+
+// SFTP File Ingestion Logic App (Consumption)
+// Deployed to same region as other resources (swedencentral)
+module sftpLogicApp 'modules/sftp-logic-app.bicep' = {
+  name: 'sftp-logic-app-deployment'
+  params: {
+    name: 'logic-sftp-${resourceSuffix}'
+    location: sftpLogicAppLocation
+    tags: tags
+    logAnalyticsWorkspaceId: logAnalytics.outputs.id
+  }
+}
+
+// API Connections for SFTP Logic App (Service Bus - managed identity)
+// Connections must be in the same region as the Logic App
+module apiConnections 'modules/api-connections.bicep' = {
+  name: 'api-connections-deployment'
+  params: {
+    location: sftpLogicAppLocation
+    tags: tags
+    serviceBusNamespaceName: serviceBus.outputs.namespaceName
+    logicAppPrincipalId: sftpLogicApp.outputs.principalId
+    logicAppName: sftpLogicApp.outputs.name
   }
 }
 
@@ -177,3 +221,12 @@ output documentIntelligenceEndpoint string = documentIntelligence.outputs.endpoi
 
 @description('Logic App name')
 output logicAppName string = logicApp.outputs.name
+
+@description('SFTP Logic App name')
+output sftpLogicAppName string = sftpLogicApp.outputs.name
+
+@description('Key Vault name')
+output keyVaultName string = keyVault.outputs.name
+
+@description('Key Vault URI')
+output keyVaultUri string = keyVault.outputs.uri

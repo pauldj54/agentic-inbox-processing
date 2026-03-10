@@ -1,0 +1,79 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "sftpFolderPath": {
+            "value": "/inbox/"
+        },
+        "sftpArchivePath": {
+            "value": "/processed/"
+        },
+        "cosmosDbAccountName": {
+            "value": "cosmos-docproc-dev-izr2ch55woa3c"
+        },
+        "cosmosDbDatabaseName": {
+            "value": "email-processing"
+        },
+        "storageAccountName": {
+            "value": "stdocprocdevizr2ch55"
+        },
+        "serviceBusNamespace": {
+            "value": "sb-docproc-dev"
+        },
+        "sharepointSiteUrl": {
+            "value": "https://contoso.sharepoint.com/sites/pe-docs"
+        },
+        "sharepointDocLibraryPath": {
+            "value": "Documents"
+        },
+        "filenameDelimiter": {
+            "value": "_"
+        },
+        "$connections": {
+            "value": {
+                "sftpwithssh": {
+                    "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/sftpwithssh",
+                    "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/sftpwithssh",
+                    "connectionName": "sftpwithssh",
+                    "connectionProperties": {}
+                },
+                "sharepointonline": {
+                    "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/sharepointonline",
+                    "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/sharepointonline",
+                    "connectionName": "sharepointonline",
+                    "connectionProperties": {}
+                },
+                "documentdb": {
+                    "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/documentdb",
+                    "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/documentdb",
+                    "connectionName": "documentdb",
+                    "connectionProperties": {
+                        "authentication": {
+                            "type": "ManagedServiceIdentity"
+                        }
+                    }
+                },
+                "azureblob": {
+                    "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/azureblob",
+                    "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/azureblob",
+                    "connectionName": "azureblob",
+                    "connectionProperties": {
+                        "authentication": {
+                            "type": "ManagedServiceIdentity"
+                        }
+                    }
+                },
+                "servicebus": {
+                    "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/servicebus",
+                    "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/servicebus",
+                    "connectionName": "servicebus",
+                    "connectionProperties": {
+                        "authentication": {
+                            "type": "ManagedServiceIdentity"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

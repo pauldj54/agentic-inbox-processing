@@ -32,7 +32,7 @@ class CosmosDBTools:
     """Tools for interacting with Azure Cosmos DB."""
     
     # Container names
-    CONTAINER_EMAILS = "emails"
+    CONTAINER_INTAKE_RECORDS = "intake-records"
     CONTAINER_PE_EVENTS = "pe-events"
     CONTAINER_CLASSIFICATIONS = "classifications"
     CONTAINER_AUDIT_LOGS = "audit-logs"
@@ -87,7 +87,7 @@ class CosmosDBTools:
         """
         with self._get_sync_client() as client:
             database = client.get_database_client(self.database_name)
-            container = database.get_container_client(self.CONTAINER_EMAILS)
+            container = database.get_container_client(self.CONTAINER_INTAKE_RECORDS)
             query = "SELECT * FROM c WHERE c.id = @emailId OR c.emailId = @emailId"
             items = list(container.query_items(
                 query=query,
@@ -126,7 +126,7 @@ class CosmosDBTools:
         
         with self._get_sync_client() as client:
             database = client.get_database_client(self.database_name)
-            container = database.get_container_client(self.CONTAINER_EMAILS)
+            container = database.get_container_client(self.CONTAINER_INTAKE_RECORDS)
             
             # Try to find the email document by id or emailId
             # The Logic App creates documents with id=emailId, so we check both
@@ -600,7 +600,7 @@ class CosmosDBTools:
         
         with self._get_sync_client() as client:
             database = client.get_database_client(self.database_name)
-            container = database.get_container_client(self.CONTAINER_EMAILS)
+            container = database.get_container_client(self.CONTAINER_INTAKE_RECORDS)
             
             # Find the email document
             query = "SELECT * FROM c WHERE c.id = @emailId OR c.emailId = @emailId"
