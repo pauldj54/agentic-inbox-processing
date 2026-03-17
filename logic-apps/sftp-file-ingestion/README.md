@@ -1,6 +1,6 @@
 # SFTP File Ingestion Logic App
 
-Consumption-tier Logic App that polls an SFTP server for new files, parses filename metadata, and routes them based on file type.
+Consumption-tier Logic App that polls an SFTP server for new files, parses filename metadata, uploads to blob storage, performs content hash dedup with 3-way routing (new/duplicate/update), and routes by file type.
 
 ## Trigger
 
@@ -9,35 +9,66 @@ Consumption-tier Logic App that polls an SFTP server for new files, parses filen
 | Setting | Value |
 |---|---|
 | Connector | `sftpwithssh` |
-| Folder | `sftpFolderPath` parameter (default: `/inbox/`) |
+| Folder | `sftpFolderPath` parameter (default: `/in/`) |
 | Poll interval | Every 1 minute |
 | Split on | Each file triggers an independent run |
 
-## Workflow Actions (11 Steps)
+## Workflow Actions (15 Steps)
 
 | # | Action | Description |
 |---|--------|-------------|
 | 1 | **Get_file_content** | Downloads file content from the SFTP server |
-| 2 | **Compute_content_hash** | MD5 hash of file content for duplicate detection |
-| 3 | **Generate_file_id** | Creates unique ID: `sftp-{guid}` |
-| 4 | **Check_for_duplicate** | Queries Cosmos DB `intake-records` for matching `sftpPath` + `contentHash` + `intakeSource='sftp'` |
-| 5 | **Is_duplicate** | If count > 0 → logs warning, file stays on SFTP (not moved). Otherwise continues. |
-| 6 | **Parse_filename_metadata** | Strips extension, splits base name by configurable delimiter (`_`) |
-| 7 | **Validate_segment_count** | Expects exactly 6 segments. If mismatch → creates error record with `metadataParseError`, file stays on SFTP. |
-| 8 | **Extract_metadata_fields** | Maps positional segments: `account`, `fund`, `docType`, `docName`, `publishedDate` (ISO), `effectiveDate` (ISO) |
-| 9 | **Upload_to_blob_storage** | Uploads to Azure Blob at `/attachments/sftp-{fileId}/{filename}` |
-| 10 | **Create_Cosmos_DB_record** | Upserts intake record with status `received` and parsed metadata |
-| 11 | **Route_by_file_type** | Switch on extension → CSV/XLSX/XLS/PDF/default |
+| 2 | **Generate_file_id** | Creates unique ID: `sftp-{guid}` (used for blob path only) |
+| 3 | **Parse_file_extension** | Extracts lowercase file extension |
+| 4 | **Strip_file_extension** | Removes extension to get base filename |
+| 5 | **Parse_filename_parts** | Splits base filename by delimiter into metadata array |
+| 6 | **Upload_to_blob** | Uploads file to Azure Blob at `/attachments/{fileId}/{filename}`. |
+| 7 | **Get_blob_md5** | HTTP HEAD to Blob REST API to retrieve `Content-MD5` (not returned by managed connector). |
+| 8 | **Compute_dedup_key** | `base64(sftpPath)` — used as Cosmos DB document ID for O(1) point-reads |
+| 9 | **Check_for_duplicate** | Cosmos DB point-read by dedup key with partition `{sftpUsername}_{YYYY-MM}` |
+| 10 | **Handle_duplicate_check** | 3-way routing based on duplicate check result (see below) |
+| 11 | **Create_intake_record_if_new** | Creates Cosmos DB record with `version: 1`, `deliveryCount: 1`, `contentHash` (only for new files; skipped for updates) |
+| 12 | **Check_if_spreadsheet / Check_if_PDF** | Routes by file extension to SharePoint or Service Bus |
+| 13 | **Copy_processed_file_to_processed** | Copies file from `/in/` to `/processed/` (archive) |
+| 14 | **Delete_file** | Deletes original file from `/in/` |
+| 15 | **Terminate_success** | Overrides run status to Succeeded (needed because step 9 returns 404/Failed for new files) |
+
+## 3-Way Dedup Routing
+
+Duplicate detection uses a Cosmos DB **point-read** where the document ID is `base64(sftpPath)` and the partition key is `{sftpUsername}_{YYYY-MM}`. Dedup is scoped to the same month — cross-month re-deliveries are treated as new files.
+
+| Check Result | Content Hash | Path | Behavior |
+|---|---|---|---|
+| 404 (not found) | — | **New file** | Create Cosmos record (`version: 1`, `deliveryCount: 1`). Continue to downstream processing. |
+| 200 (found) | Same as stored | **True duplicate** | Increment `deliveryCount`, append `deliveryHistory`, update `lastDeliveredAt`. Terminate with `Cancelled` status. |
+| 200 (found) | Different from stored | **Content update** | Update `contentHash`, increment `version` + `deliveryCount`, append `deliveryHistory`. Continue to downstream processing (re-upload to SharePoint). |
+| Other error | — | **Error** | Terminate with `Failed` status. |
+
+Content hash source: `outputs('Get_blob_md5')['headers']['Content-MD5']` — retrieved via HTTP HEAD to Azure Blob REST API with managed identity. The managed blob connector's Create blob response does not include `ContentMD5`.
+
+## Delivery Tracking Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `contentHash` | string | MD5 hash of file content from blob upload |
+| `version` | number | Document version, starts at 1. Incremented on content updates. |
+| `deliveryCount` | number | Total times this file path was delivered (including duplicates). |
+| `deliveryHistory` | object[] | Array of `{deliveredAt, contentHash, action}` entries. |
+| `lastDeliveredAt` | string (ISO 8601) | Timestamp of most recent delivery. |
+
+## Partition Key
+
+Container: `intake-records`, partition key: `/partitionKey`
+
+SFTP records use `{sftpUsername}_{YYYY-MM}` (e.g., `partnerreader_2026-03`). This value is immutable once set and enables efficient point-reads within each partition.
 
 ## File Type Routing
 
 | Extension | Route | Actions |
 |-----------|-------|---------|
-| `csv` | SharePoint | Upload to SharePoint → Update Cosmos (status: `archived`, `sharepointPath` set) → Move to SFTP archive |
-| `xlsx` | SharePoint | Same as CSV |
-| `xls` | SharePoint | Same as CSV |
-| `pdf` | Service Bus | Send to `email-intake` queue → Update Cosmos (queue: `email-intake`) → Move to SFTP archive |
-| Other | Skip | Log unsupported file type. File stays on SFTP (not moved). |
+| `csv`, `xlsx`, `xls` | SharePoint | Upload via Graph API HTTP → Update Cosmos (status: `archived`, `sharepointPath` set) → Archive on SFTP |
+| `pdf` | Service Bus | Send to `email-intake` queue (includes `contentHash`, `fileSize`) → Update Cosmos → Archive on SFTP |
+| Other | Skip | Logged as unsupported. File stays on SFTP. |
 
 ## SharePoint Folder Path Convention
 
@@ -46,6 +77,8 @@ Consumption-tier Logic App that polls an SFTP server for new files, parses filen
 ```
 
 Example: `Documents/H/HorizonCapital/GrowthFundIII/HorizonCapital_GrowthFundIII_NAVReport_Q1_20260309_20260301.csv`
+
+SharePoint upload uses **HTTP connector with Graph API** (`ActiveDirectoryOAuth` client credentials), not the managed SharePoint connector.
 
 ## Filename Metadata Parsing
 
@@ -62,15 +95,13 @@ Example: `Documents/H/HorizonCapital/GrowthFundIII/HorizonCapital_GrowthFundIII_
 
 Date fields are converted from `YYYYMMDD` to ISO 8601 (`YYYY-MM-DD`).
 
-Segment count must be exactly 6. If not, the workflow creates an error record in Cosmos DB with `metadataParseError` and the file remains on SFTP.
-
 ## Error Handling
 
 | Error Scenario | Behavior |
 |---|---|
-| Duplicate file (same `sftpPath` + `contentHash`) | Logged, skipped. File stays on SFTP. |
-| Filename parse failure (segment count ≠ 6) | Cosmos error record created. File stays on SFTP. |
-| Unsupported file type | Logged, skipped. File stays on SFTP. |
+| True duplicate (same path + same content hash) | `deliveryCount` incremented, run terminated as `Cancelled`. File archived. |
+| Content update (same path + different hash) | Record updated with new hash and incremented `version`. File re-processed and re-uploaded. |
+| Unexpected Cosmos error (non-404, non-200) | Run terminated as `Failed`. |
 | SFTP connection failure | Logic App retries per connector policy. |
 | Blob upload failure | Run fails. File stays on SFTP for next poll. |
 | Cosmos DB write failure | Run fails. File stays on SFTP for next poll. |
@@ -81,13 +112,12 @@ Segment count must be exactly 6. If not, the workflow creates an error record in
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `sftpFolderPath` | String | `/inbox/` | SFTP folder to poll for new files |
+| `sftpFolderPath` | String | `/in/` | SFTP folder to poll for new files |
 | `sftpArchivePath` | String | `/processed/` | SFTP folder to move processed files to |
+| `sftpUsername` | String | `partnerreader` | SFTP username, used in partition key computation |
 | `cosmosDbAccountName` | String | — | Cosmos DB account name |
 | `cosmosDbDatabaseName` | String | `email-processing` | Cosmos DB database name |
-| `storageAccountName` | String | — | Azure Storage account name |
-| `sharepointSiteUrl` | String | — | SharePoint site URL |
-| `sharepointDocLibraryPath` | String | `Documents` | SharePoint document library root path |
+| `storageAccountName` | String | `stdocprocdevizr2ch55` | Azure Storage account name |
 | `filenameDelimiter` | String | `_` | Delimiter for splitting filename into metadata segments |
 
 ## API Connections
@@ -95,7 +125,7 @@ Segment count must be exactly 6. If not, the workflow creates an error record in
 | Connection | Auth | Purpose |
 |---|---|---|
 | `sftpwithssh` | SSH private key (from Key Vault) | SFTP server access |
-| `sharepointonline` | Entra ID app (client credentials) | SharePoint file upload |
+| `HTTP` (Graph API) | `ActiveDirectoryOAuth` (client credentials) | SharePoint file upload via Microsoft Graph |
 | `documentdb` | Managed Identity | Cosmos DB reads/writes |
 | `azureblob` | Managed Identity | Azure Blob Storage upload |
 | `servicebus` | Managed Identity | Service Bus queue send |

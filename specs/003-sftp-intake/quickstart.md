@@ -22,7 +22,7 @@
    STORAGE_ACCOUNT_URL=https://stdocprocdevizr2ch55.blob.core.windows.net
    PIPELINE_MODE=full
    ```
-6. **Cosmos DB migration completed**: The `intake-records` container must exist (migrated from `emails`).
+6. **Cosmos DB migration completed**: The `intake-records` container must exist with partition key `/partitionKey` (migrated from `emails` with partition key `/status`). Partition values follow the format `{source}_{YYYY-MM}` (e.g., `partnerreader_2026-03` for SFTP, `sender-domain.com_2026-03` for email).
 
 ## No New Dependencies
 
@@ -115,11 +115,43 @@ python -m src.agents.run_agent
 - Cosmos DB record has `pipelineMode: "triage-only"`, `stepsExecuted` does not include `"classification"`
 - Message routed to the `triage-complete` queue
 
-### 6. Manual Test — Duplicate Detection
+### 6. Manual Test — Duplicate Detection (Delivery Tracking)
 
-**Step 1**: Place the same file on the SFTP server twice (same path, same content).
+**Step 1**: Place a CSV file with valid naming convention on the SFTP server:
+```
+/inbox/HorizonCapital_GrowthFundIII_NAVReport_MarchNAV_20260309_20260301.csv
+```
 
-**Step 2**: Verify only one Cosmos DB record is created. Second detection is logged and skipped. For CSV/Excel, only one SharePoint upload occurs. For PDF, only one Service Bus message is sent.
+**Step 2**: Wait for the Logic App to trigger and process the file. Verify:
+- Cosmos DB record created with `version: 1`, `deliveryCount: 1`, `deliveryHistory` has one entry with `action: "new"`
+- File archived to `/processed/`
+
+**Step 3**: Place the **exact same file** (same content) at the same path again:
+```
+/inbox/HorizonCapital_GrowthFundIII_NAVReport_MarchNAV_20260309_20260301.csv
+```
+
+**Step 4**: Wait for the Logic App to trigger. Verify:
+- Cosmos DB record updated: `deliveryCount: 2`, `deliveryHistory` has two entries (second with `action: "duplicate"`)
+- `version` unchanged (still `1`) — content is the same
+- No new SharePoint upload (skipped — true duplicate)
+- Logic App run terminates with `Cancelled` status
+
+### 6a. Manual Test — Content Update Detection
+
+**Step 1**: Ensure a file was already processed at a path (from test 6 above).
+
+**Step 2**: Place a file with the **same name but different content** at the same path:
+```
+/inbox/HorizonCapital_GrowthFundIII_NAVReport_MarchNAV_20260309_20260301.csv
+```
+(Edit the file contents before uploading — e.g., add a new row)
+
+**Step 3**: Wait for the Logic App to trigger. Verify:
+- Cosmos DB record updated: `version: 2` (incremented), `deliveryCount: 3`, `contentHash` updated to new MD5
+- `deliveryHistory` has three entries (third with `action: "update"`)
+- New SharePoint upload occurs (updated content pushed to SharePoint)
+- File archived to `/processed/`
 
 ### 7. Manual Test — Unsupported File Type
 

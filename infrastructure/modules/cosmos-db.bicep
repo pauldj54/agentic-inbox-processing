@@ -69,7 +69,7 @@ resource intakeRecordsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDataba
     resource: {
       id: 'intake-records'
       partitionKey: {
-        paths: ['/status'] // Partition by status for efficient queries
+        paths: ['/partitionKey'] // Composite: {source}_{YYYY-MM} for tenant-per-month distribution
         kind: 'Hash'
       }
       indexingPolicy: {
@@ -85,7 +85,7 @@ resource intakeRecordsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDataba
         ]
         compositeIndexes: [
           [
-            { path: '/status', order: 'ascending' }
+            { path: '/partitionKey', order: 'ascending' }
             { path: '/receivedAt', order: 'descending' }
           ]
           [
@@ -94,6 +94,10 @@ resource intakeRecordsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDataba
           ]
           [
             { path: '/intakeSource', order: 'ascending' }
+            { path: '/status', order: 'ascending' }
+          ]
+          [
+            { path: '/partitionKey', order: 'ascending' }
             { path: '/status', order: 'ascending' }
           ]
         ]

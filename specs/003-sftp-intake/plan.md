@@ -1,46 +1,37 @@
-# Implementation Plan: SFTP File Intake Channel
+# Implementation Plan: SFTP File Intake — Content Hash Dedup & Delivery Tracking
 
-**Branch**: `003-sftp-intake` | **Date**: 2026-03-09 | **Spec**: [spec.md](spec.md)
+**Branch**: `003-sftp-intake` | **Date**: 2026-03-17 | **Spec**: [spec.md](spec.md)
 **Input**: Feature specification from `/specs/003-sftp-intake/spec.md`
+
+**Note**: This plan covers the **content hash dedup, file update detection, and delivery tracking** enhancements to the existing SFTP intake Logic App workflow. The base workflow (trigger, download, parse, backup, route, archive) is already deployed and working.
 
 ## Summary
 
-Add a second intake channel triggered by new files arriving in a monitored SFTP folder. A new Logic App Consumption workflow (`sftp-file-ingestion`) polls the SFTP server via the built-in SFTP-SSH managed connector, authenticated by SSH private key stored in Azure Key Vault. Files are routed by extension: CSV/Excel files have their filename metadata parsed, are backed up to blob storage, logged in Cosmos DB, and uploaded directly to SharePoint via the Logic App SharePoint connector (Entra ID app registration with `Sites.ReadWrite.All`). PDF files follow the same initial path (download → blob → Cosmos DB) but are routed to the `email-intake` Service Bus queue for classification by the existing Python agent. The Cosmos DB container is renamed from `emails` to `intake-records` with a unified schema using an `intakeSource` discriminator. Two new `Microsoft.Web/connections` API Connection resources are provisioned via Bicep: `sftpWithSsh` (SSH private key from Key Vault) and `sharepointonline` (Entra ID client secret from Key Vault).
+Enhance the SFTP intake workflow with content-hash-based duplicate detection, file update handling, and delivery tracking. The current dedup key (`base64(path)`) only catches same-path duplicates but cannot distinguish re-uploads of identical files from genuine content updates. By leveraging the MD5 hash that Azure Blob Storage automatically computes on upload, the system gains content-aware dedup at zero additional cost. The Cosmos DB data model is extended with `contentHash`, `version`, `deliveryCount`, and `deliveryHistory` fields, and the partition key is changed from `/status` to `/partitionKey` — a composite value combining source identifier with year-month (e.g., `partnerreader_2026-03` for SFTP, `partner-pe-firm.com_2026-03` for email) — to enable tenant-per-month data distribution and stable point-reads within each partition.
 
 ## Technical Context
 
-**Language/Version**: Python 3.12+ (agent, dashboard), Bicep (infrastructure), JSON (Logic App workflow)  
-**Primary Dependencies**: FastAPI, azure-cosmos, azure-servicebus, azure-identity, azure-storage-blob (all existing — no new packages)  
-**Storage**: Azure Cosmos DB (serverless, `email-processing` database, `intake-records` container), Azure Blob Storage, SharePoint Online  
-**Testing**: pytest with `asyncio_mode="auto"`  
-**Target Platform**: Azure (Logic Apps Consumption, App Service Linux, Service Bus Standard)  
-**Project Type**: Event-driven document processing pipeline (web-service + serverless workflows)  
-**Performance Goals**: CSV/Excel processed within 2 minutes of SFTP detection (SC-001). PDF classification within 5 minutes (SC-002).  
-**Constraints**: SFTP polling interval ~1 minute. File size limit 50 MB. SharePoint connector requires Entra ID app registration (not managed identity).  
-**Scale/Scope**: Low-volume batch processing (~tens of files/day). Single SFTP source, single SharePoint destination.
+**Language/Version**: Logic Apps (Consumption tier, Azure), Python 3.12 (agent/dashboard)
+**Primary Dependencies**: Logic App managed connectors (SFTP-SSH, Cosmos DB, Blob, Service Bus), Graph API (SharePoint), Python Azure SDKs
+**Storage**: Cosmos DB (`email-processing` db, `intake-records` collection), Azure Blob Storage (`stdocprocdevizr2ch55`), SFTP (`sftpprocdevizr2ch55`)
+**Testing**: Manual Logic App runs + pytest (unit/integration)
+**Target Platform**: Azure (Logic Apps Consumption, swedencentral)
+**Project Type**: Cloud workflow (Logic Apps) + web-service (Python dashboard)
+**Performance Goals**: File processing < 2 minutes from SFTP trigger to archive (SC-001)
+**Constraints**: Must be SFTP-agnostic (no reliance on Azure-specific SFTP features for content hashing). Consumption tier Logic App limitations (no stateful workflows, no Standard-tier inline code).
+**Scale/Scope**: Single Logic App workflow, ~15 actions, single Cosmos DB collection
 
-## Constitution Check (Pre-Design)
+## Constitution Check
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-- **Code simplicity gate**: ✅ PASS. SFTP intake is a separate Logic App workflow feeding into the existing pipeline. No classification logic is duplicated — PDFs reuse the existing agent. CSV/Excel are handled entirely within the Logic App (no new Python code for their lifecycle). The only Python changes are: (1) container rename constant, (2) agent source detection for SFTP messages, (3) dashboard source column.
-- **UX gate**: ✅ PASS. Dashboard change is minimal — one "Source" column/badge (CAR-002). No new screens or flows.
-- **Responsive gate**: ✅ PASS. The source column is a small badge that collapses naturally at mobile widths.
-- **Dependency gate**: ✅ PASS. No new Python packages. SFTP-SSH and SharePoint connectors are built-in Logic App managed connectors. All Azure SDK packages already in `requirements.txt`.
-- **Auth gate**: ⚠️ EXCEPTION DOCUMENTED. Two non-Entra-ID auth mechanisms required:
-  - **SFTP-SSH**: SSH private key (Certificate/key auth is the only authentication method supported by the SFTP-SSH connector for remote SFTP servers. Entra ID is not applicable for external SFTP endpoints).
-  - **SharePoint**: Entra ID app registration with client secret (application permissions `Sites.ReadWrite.All` for unattended Logic App file uploads. Managed identity is not supported by the Logic App SharePoint connector in Consumption tier).
-  - Both secrets are stored in Azure Key Vault and injected at Bicep deployment time via `getSecret()`. Compensating controls: Key Vault access policies, secret rotation policy.
-- **Validation gate**: ✅ PASS. Test plan is focused: unit tests for container rename, integration tests for SFTP intake flow (CSV/Excel SharePoint routing, PDF classification routing, duplicate detection), manual tests for end-to-end verification.
-- **Logging gate**: ✅ PASS. All processing events use Python `logging` module with structured entries. Logic App run history provides built-in structured logging.
-
-### Post-Design Re-Evaluation
-
-All gates confirmed post-Phase 1 design. No new violations introduced:
-- `data-model.md`: Clean schema extension with conditional fields — no complexity added.
-- `contracts.md`: API Connection resources use Key Vault `getSecret()` at deploy time — auth exception boundaries unchanged.
-- `quickstart.md`: 9+ test scenarios cover all happy paths and error cases — validation remains pragmatic.
-- **No gate changes required.**
+- **Code simplicity gate**: PASS — Changes are confined to reordering existing Logic App actions and adding fields to the Cosmos DB document. No new abstractions or services introduced. Content hash uses the MD5 already computed by Blob Storage.
+- **UX gate**: PASS — Dashboard gains a delivery count badge and version indicator on existing records. No new screens or flows.
+- **Responsive gate**: PASS — Dashboard changes are column additions to existing table; responsive behavior already handled.
+- **Dependency gate**: PASS — No new packages. Blob Storage MD5 is a built-in feature. Cosmos DB partition key change uses existing SDK.
+- **Auth gate**: PASS — No auth changes. All connections continue using existing auth (MI for Cosmos/Blob/SB, SSH key for SFTP, OAuth for SharePoint). Constitution exception for SharePoint client secret is documented in CAR-005.
+- **Validation gate**: PASS — Tests cover 3 scenarios: new file, true duplicate, content update. Proportional to the 3-way routing logic.
+- **Logging gate**: PASS — Dedup outcomes (new/duplicate/update) are tracked in Cosmos DB `deliveryHistory` — structured and queryable. No print-style logging.
 
 ## Project Structure
 
@@ -48,67 +39,41 @@ All gates confirmed post-Phase 1 design. No new violations introduced:
 
 ```text
 specs/003-sftp-intake/
-├── plan.md              # This file
-├── research.md          # Phase 0 output — technology decisions & rationale
-├── data-model.md        # Phase 1 output — Cosmos DB schema changes
-├── quickstart.md        # Phase 1 output — manual testing guide
-├── contracts/
-│   └── contracts.md     # Phase 1 output — Service Bus, Cosmos DB, Logic App contracts
-├── checklists/
-│   └── requirements.md  # Requirements coverage checklist
+├── plan.md              # This file (updated for content hash dedup)
+├── research.md          # Phase 0 output (updated)
+├── data-model.md        # Phase 1 output (updated with new fields + partition key change)
+├── quickstart.md        # Phase 1 output (updated)
+├── contracts/           # Phase 1 output (updated)
+│   └── contracts.md
 └── tasks.md             # Phase 2 output (/speckit.tasks command)
 ```
 
 ### Source Code (repository root)
 
 ```text
-infrastructure/
-├── main.bicep                          # Add SFTP Logic App + API Connections modules
-├── modules/
-│   ├── cosmos-db.bicep                 # Rename container: emails → intake-records
-│   ├── logic-app.bicep                 # Existing email Logic App (unchanged)
-│   ├── sftp-logic-app.bicep            # NEW: SFTP file ingestion Logic App + API connections
-│   ├── role-assignments.bicep          # Add SFTP Logic App identity roles
-│   └── ...                             # Other modules unchanged
-├── parameters/
-│   ├── dev.bicepparam                  # Add SFTP/SharePoint/Key Vault params
-│   └── prod.bicepparam                 # Add SFTP/SharePoint/Key Vault params
-
 logic-apps/
-├── email-ingestion/                    # Existing (update Cosmos container ref)
-│   ├── workflow.json                   # Update container path: emails → intake-records
-│   └── parameters.dev.json            # Update container name reference
-└── sftp-file-ingestion/                # NEW: SFTP Logic App workflow
-    ├── workflow.json                   # 11-step SFTP intake workflow
-    └── parameters.dev.json            # SFTP/SharePoint connection params
+└── sftp-file-ingestion/
+    └── workflow.json         # Logic App workflow definition (reordered + new actions)
+
+infrastructure/
+├── main.bicep               # Updated: new Cosmos container or migration script
+└── modules/
+    └── cosmos-db.bicep       # Updated: partition key change
 
 src/
-├── agents/
-│   ├── tools/
-│   │   └── cosmos_tools.py            # Rename CONTAINER_EMAILS → CONTAINER_INTAKE_RECORDS
-│   └── email_classifier_agent.py      # Add intakeSource detection for SFTP
-├── webapp/
-│   ├── main.py                        # Update container ref, add source column data
-│   └── templates/
-│       └── dashboard.html             # Add Source column/badge
+└── webapp/
+    └── templates/
+        └── dashboard.html    # Updated: delivery count + version columns
 
-tests/
-├── unit/
-│   └── test_container_rename.py       # NEW: Verify constant change
-└── integration/
-    ├── test_flow.py                   # Update container references
-    ├── test_link_download_flow.py     # Update container references
-    └── test_sftp_intake_flow.py       # NEW: SFTP intake integration tests
-
-utils/
-└── migrate_cosmos_container.py        # NEW: One-time migration script (emails → intake-records)
+specs/
+└── 003-sftp-intake/
+    ├── data-model.md         # Updated: new fields, partition key
+    └── contracts/
+        └── contracts.md      # Updated: workflow action order, dedup logic
 ```
 
-**Structure Decision**: Follows existing single-project layout. SFTP Logic App gets its own Bicep module (`sftp-logic-app.bicep`) and workflow directory (`logic-apps/sftp-file-ingestion/`), mirroring the pattern established by the email Logic App. No new Python packages or project structure changes.
+**Structure Decision**: Logic App workflow + Cosmos DB schema changes + dashboard columns. No new services or compute resources.
 
 ## Complexity Tracking
 
-| Violation | Why Needed | Simpler Alternative Rejected Because |
-|-----------|------------|-------------------------------------|
-| SFTP-SSH: SSH private key auth (non-Entra) | External SFTP server — Entra ID not supported | Only option for SFTP-SSH connector authentication against external endpoints |
-| SharePoint: Entra ID app registration with client secret (non-managed-identity) | Logic App Consumption tier SharePoint connector does not support managed identity for application permissions | User-delegated auth requires interactive sign-in — unusable for background Logic App |
+> **No constitution violations identified.** All gates pass. The design uses existing blob MD5 (no new dependencies), keeps the Logic App simple (reorder + add patch actions), and the partition key change is the minimum viable fix for stable dedup reads.

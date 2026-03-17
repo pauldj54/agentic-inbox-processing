@@ -163,6 +163,8 @@
                     "method": "post",
                     "body": {
                         "id": "@{triggerBody()?['id']}",
+                        "intakeSource": "email",
+                        "partitionKey": "@{concat(replace(last(split(triggerBody()?['from'], '@')), '>', ''), '_', formatDateTime(triggerBody()?['receivedDateTime'], 'yyyy-MM'))}",
                         "status": "received",
                         "confidenceLevel": "pending",
                         "receivedAt": "@{triggerBody()?['receivedDateTime']}",

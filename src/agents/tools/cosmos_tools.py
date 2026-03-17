@@ -16,6 +16,31 @@ from azure.cosmos.aio import CosmosClient as AsyncCosmosClient
 logger = logging.getLogger(__name__)
 
 
+def _extract_sender_domain(from_field: str) -> str:
+    """Extract domain from an email 'from' field."""
+    if not from_field:
+        return "unknown"
+    if "<" in from_field and ">" in from_field:
+        from_field = from_field.split("<")[1].split(">")[0]
+    if "@" in from_field:
+        return from_field.split("@")[1].strip().lower()
+    return from_field.strip().lower() or "unknown"
+
+
+def _compute_email_partition_key(from_field: str, received_at: str) -> str:
+    """Compute partitionKey = {sender_domain}_{YYYY-MM} for an email record."""
+    domain = _extract_sender_domain(from_field)
+    if received_at:
+        try:
+            dt = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+            month = dt.strftime("%Y-%m")
+        except (ValueError, TypeError):
+            month = datetime.utcnow().strftime("%Y-%m")
+    else:
+        month = datetime.utcnow().strftime("%Y-%m")
+    return f"{domain}_{month}"
+
+
 def parse_bool(value: Union[str, bool, None]) -> bool:
     """
     Parse a value that might be a string boolean to actual boolean.
@@ -144,7 +169,6 @@ class CosmosDBTools:
             
             if not items:
                 # Document not found - create a new one from email_data if available
-                old_status = None  # No existing document
                 if email_data:
                     logger.info(f"Creating new email document for {email_id[:20]}...")
                     # Get attachment count
@@ -160,9 +184,14 @@ class CosmosDBTools:
                         "attachmentsCount": int(att_count) if att_count else 0,
                         "attachmentPaths": email_data.get("attachmentPaths", []),
                         "downloadFailures": [],  # Scaffold — populated by US2/T013
-                        "status": "received",  # Always start with received status (partition key)
+                        "intakeSource": "email",
+                        "status": "received",
                         "createdAt": datetime.utcnow().isoformat()
                     }
+                    # Compute partitionKey = {sender_domain}_{YYYY-MM}
+                    doc["partitionKey"] = _compute_email_partition_key(
+                        doc["from"], doc["receivedAt"]
+                    )
                     # Persist link download metadata if available
                     link_result = email_data.get("_link_download_result")
                     if link_result:
@@ -173,8 +202,6 @@ class CosmosDBTools:
                     return None
             else:
                 doc = items[0]
-                # Capture old_status BEFORE any modifications (since doc and items[0] are same reference)
-                old_status = doc.get("status")
                 # Ensure doc has required fields from email_data if missing
                 if email_data:
                     if not doc.get("from"):
@@ -262,24 +289,16 @@ class CosmosDBTools:
             doc["hasAttachments"] = len(actual_paths) > 0
 
             doc["updatedAt"] = datetime.utcnow().isoformat()
+
+            # Ensure partitionKey is set (backfill for legacy docs without it)
+            if "partitionKey" not in doc:
+                doc["partitionKey"] = _compute_email_partition_key(
+                    doc.get("from", ""), doc.get("receivedAt", "")
+                )
+            if "intakeSource" not in doc:
+                doc["intakeSource"] = "email"
             
-            # Since partition key is /status, changing status creates a new document
-            # We need to delete the old one first if status changed
-            # Note: old_status was captured earlier BEFORE modifying doc
-            new_status = doc.get("status")
-            
-            logger.debug(f"Status check: old_status={old_status}, new_status={new_status}, items_count={len(items) if items else 0}")
-            
-            if items and old_status and old_status != new_status:
-                # Delete the old document with the old partition key
-                try:
-                    logger.info(f"Deleting old document {email_id[:20]}... with partition_key={old_status}")
-                    container.delete_item(item=email_id, partition_key=old_status)
-                    logger.info(f"Successfully deleted old document with status={old_status}")
-                except Exception as e:
-                    logger.warning(f"Could not delete old document: {e}")
-            
-            # Upsert the document with new status
+            # Upsert the document (partitionKey is immutable, no delete needed)
             result = container.upsert_item(doc)
             logger.info(f"Updated email document: {email_id[:20]}...")
             

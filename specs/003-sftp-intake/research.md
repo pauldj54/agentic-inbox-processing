@@ -115,11 +115,11 @@ Rename the Cosmos DB container from `emails` to `intake-records`. Migrate existi
 ### Rationale
 - The container name `emails` is misleading when it also stores SFTP-sourced records. User explicitly chose rename (clarification Q2).
 - Cosmos DB does not support renaming a container in-place. Migration requires: (1) create new container `intake-records` with same partition key + indexing policy, (2) copy all documents from `emails` to `intake-records`, backfilling `intakeSource: "email"` on each, (3) update all code references, (4) delete old container.
-- The `/status` partition key strategy remains valid — SFTP records use the same status lifecycle (`received` → `classified` / `archived` / `discarded` / `needs_review`).
+- The partition key changes from `/status` to `/partitionKey` — a composite `{source_identifier}_{YYYY-MM}` value. See §6 for full rationale.
 
 ### Migration Strategy
 1. **Infrastructure (Bicep)**: Update `cosmos-db.bicep` to create `intake-records` container instead of `emails`.
-2. **Data migration script**: One-time Python script to copy documents from `emails` to `intake-records`, adding `intakeSource: "email"` to each document.
+2. **Data migration script**: One-time Python script to copy documents from `emails` to `intake-records`, adding `intakeSource: "email"` and computing `partitionKey` (= `{sender_domain}_{YYYY-MM}` from `from` field + `receivedAt`) for each document.
 3. **Code references**: Update `CONTAINER_EMAILS` constant in `cosmos_tools.py`, container reference in `webapp/main.py`, and Logic App `workflow.json` Cosmos DB action.
 4. **Backward compatibility**: During migration, both containers may coexist briefly. The migration script should be idempotent.
 
@@ -156,24 +156,67 @@ Adapt the existing `process_next_email()` method to detect `intakeSource: "sftp"
 
 ---
 
-## 6. Duplicate Detection Strategy
+## 6. Duplicate Detection Strategy (Revised 2026-03-17)
 
 ### Decision
-Use file path + content hash (MD5 of file content) to detect duplicates at the Logic App level.
+Use a **two-layer dedup** approach: path-based point-read for initial detection, content hash (blob MD5) for distinguishing true duplicates from content updates. Dedup occurs **after** blob upload.
 
-### Rationale
-- FR-013 requires duplicate detection based on file path and content hash.
-- The Logic App computes an MD5 hash of the file content after download (using a `Compose` action with `@{hashBody('Get_file_content', 'md5')}` or equivalent expression).
-- Before creating the Cosmos DB record, the Logic App queries for an existing record with the same `sftpPath` and `contentHash`. If found, the file is skipped and logged.
-- This prevents reprocessing if the same file appears again (e.g., after a failed move to `/processed/`).
-- Content hash alone would catch renamed duplicates; path alone would miss modified files at the same path. Using both provides robust deduplication.
+### Dedup Key & Cosmos Document ID
+The dedup key is `base64(sftpPath)` (path only, no etag). This key is used as the **Cosmos DB document id** — not the generated `sftp-{guid}`. This enables O(1) point-reads for dedup checks.
+
+**Previous approach (rejected)**: `base64(concat(path, '|', etag))` — failed because SFTP etag contains a timestamp component (`timestamp|filesize`) that changes on every re-upload, causing false negatives (same file treated as new).
+
+### Content Hash Source
+The content hash comes from `body('Upload_to_blob')?['ContentMD5']` — the MD5 that Azure Blob Storage automatically computes on upload. This is:
+- **Free**: No additional compute or libraries needed.
+- **SFTP-agnostic**: Hashes raw file content, not SFTP metadata.
+- **Already available**: The `Upload_to_blob` action already exists in the workflow.
+
+### Flow Order Change
+The blob upload (`Upload_to_blob`) must happen **before** the dedup check so that the content hash is available for comparison. The new flow order is:
+
+1. Trigger → Get file content → Generate IDs → Upload_to_blob
+2. Compute_dedup_key (`base64(sftpPath)`)
+3. Check_for_duplicate (point-read with dedup key as doc id, partition key `"sftp"`)
+4. **3-way routing**:
+   - **New file** (404): Create Cosmos record → downstream processing
+   - **True duplicate** (200, same contentHash): Increment `deliveryCount`, append to `deliveryHistory` → skip downstream
+   - **Content update** (200, different contentHash): Update `contentHash`, increment `version`, append to `deliveryHistory` → re-run downstream processing
+
+### Partition Key Change: `/status` → `/partitionKey`
+The partition key must change from `/status` to `/partitionKey` because:
+- Point-read dedup requires knowing the partition key value at read time.
+- With `/status`, when a document's status changes from `"received"` to `"classified"`, the dedup check (which always reads with partition `"received"`) would miss existing records — a false negative.
+- `/partitionKey` uses a composite `{source_identifier}_{YYYY-MM}` format — for emails: `{sender_domain}_{YYYY-MM}` (e.g., `partner-pe-firm.com_2026-03`); for SFTP: `{sftp_username}_{YYYY-MM}` (e.g., `sftp-partner-A_2026-03`). This value is **stable**: it never changes after creation, and provides natural tenant-per-month data distribution.
+- Dedup point-reads for SFTP use the known SFTP username + current year-month as partition key. Note: dedup is scoped to the current month; cross-month re-deliveries are treated as new files.
+- This requires **recreating the Cosmos DB container** (or creating a new one + migrating data), as Cosmos DB does not support partition key changes on existing containers.
+
+### 3-Way Routing Logic
+
+| Scenario | Check_for_duplicate Result | contentHash Match | Action |
+|---|---|---|---|
+| New file | 404 (Failed) | N/A | Create Cosmos record with `version: 1`, `deliveryCount: 1` → process downstream |
+| True duplicate | 200 (Succeeded) | Same | Patch: increment `deliveryCount`, append `deliveryHistory` entry → Terminate (Cancelled) |
+| Content update | 200 (Succeeded) | Different | Patch: update `contentHash`, increment `version` + `deliveryCount`, append `deliveryHistory` → re-process downstream |
+
+### Delivery Tracking Fields (New)
+| Field | Type | Description |
+|---|---|---|
+| `contentHash` | `string` | MD5 from `body('Upload_to_blob')?['ContentMD5']` |
+| `version` | `number` | Starts at 1, incremented on content updates |
+| `deliveryCount` | `number` | Total times this file path was delivered (including duplicates) |
+| `deliveryHistory` | `object[]` | Array of `{deliveredAt, contentHash, action}` entries |
+| `lastDeliveredAt` | `string` (ISO 8601) | Timestamp of most recent delivery |
 
 ### Alternatives Considered
 | Alternative | Why Rejected |
 |---|---|
-| Filename-only dedup | Fragile — same name, different content should be processed |
-| Content hash only | Different files at different paths with same content might be intentional |
+| Path + etag dedup key | Etag contains timestamp, changes on re-upload → false negatives |
+| Inline JavaScript MD5 | Logic App Consumption tier has 5-second timeout on inline code |
+| Cosmos DB UDF for hashing | 2MB document size limit, adds complexity |
+| Path-only dedup (no hash) | Cannot distinguish true duplicates from content updates |
 | External dedup service | Over-engineering for this volume |
+| Keep `/status` partition key | Breaks point-read dedup when status changes (false negatives) |
 
 ---
 
@@ -199,6 +242,8 @@ Add a "Source" column to the dashboard table showing "Email" or "SFTP" based on 
 ---
 
 ## 8. SharePoint Connector for CSV/Excel Upload
+
+> **⚠️ SUPERSEDED**: This decision was revised during implementation. The SharePoint managed connector does not support service principal authentication in the Logic App Consumption tier. The actual implementation uses **HTTP actions with Microsoft Graph API** (`PUT /drives/{driveId}/root:/{path}:/content` with `ActiveDirectoryOAuth`). See contracts.md §3 step 11a for the implemented approach.
 
 ### Decision
 Use the Logic App built-in SharePoint managed connector ("Create file" action) to upload CSV/Excel files directly to a SharePoint document library with structured folder paths. No Service Bus intermediary for CSV/Excel.
@@ -232,6 +277,8 @@ Use the Logic App built-in SharePoint managed connector ("Create file" action) t
 ---
 
 ## 9. SharePoint API Connection Provisioning (Entra ID App Registration)
+
+> **⚠️ SUPERSEDED**: The `sharepointonline` API Connection is NOT used. SharePoint uploads use HTTP actions with Graph API and `ActiveDirectoryOAuth`. The SharePoint credentials (`sharepointClientId`, `sharepointClientSecret`, `sharepointTenantId`, `sharepointDriveId`) are Logic App workflow parameters, not API Connection resources. See contracts.md §3 for the implemented approach.
 
 ### Decision
 Provision the `sharepointonline` API Connection as a `Microsoft.Web/connections` Bicep resource. Authenticate using an Entra ID app registration with application permissions (`Sites.ReadWrite.All`) and a client secret stored in Azure Key Vault.

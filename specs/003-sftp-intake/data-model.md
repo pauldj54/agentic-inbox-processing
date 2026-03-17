@@ -8,8 +8,8 @@
 ### 1. Intake Record (Cosmos DB — container rename + schema extension)
 
 **Container**: `intake-records` (renamed from `emails`)  
-**Partition key**: `/status`  
-**Change type**: Breaking — container rename + schema migration
+**Partition key**: `/partitionKey` (changed from `/status` — see research.md §6)  
+**Change type**: Breaking — container rename + partition key change + schema migration
 
 #### Container Rename
 
@@ -19,8 +19,11 @@ The `emails` container is renamed to `intake-records` to reflect its multi-sourc
 |---|---|---|
 | Container name | `emails` | `intake-records` |
 | Code constant | `CONTAINER_EMAILS = "emails"` | `CONTAINER_INTAKE_RECORDS = "intake-records"` |
-| Partition key | `/status` | `/status` (unchanged) |
-| Indexing policy | Composite indexes on status+receivedAt, confidenceLevel+receivedAt | Same + composite on intakeSource+status |
+| Partition key | `/status` | `/partitionKey` (composite: `{source}_{YYYY-MM}`, e.g., `sftp-partner-A_2026-03`) |
+| Document ID (SFTP) | `sftp-{guid}` | `base64(sftpPath)` (doubles as dedup key for O(1) point-reads) |
+| Indexing policy | Composite indexes on status+receivedAt, confidenceLevel+receivedAt | Same + composite on partitionKey+status |
+
+> **Why `/partitionKey`?** The previous partition key `/status` broke point-read dedup: when a document's status changed from `"received"` to `"classified"`, the dedup check (reading with partition `"received"`) would miss it. `/partitionKey` uses a composite `{source_identifier}_{YYYY-MM}` format — for emails: `{sender_domain}_{YYYY-MM}` (e.g., `partner-pe-firm.com_2026-03`); for SFTP: `{sftp_username}_{YYYY-MM}` (e.g., `sftp-partner-A_2026-03`). This value is immutable once set, provides natural tenant-per-month data distribution, and enables efficient point-reads within each partition. Note: dedup detection is scoped to the same partition (month); cross-month re-deliveries are treated as new files. See [research.md §6](research.md) for full rationale.
 
 #### Field: `intakeSource` (new, required)
 
@@ -32,6 +35,23 @@ The `emails` container is renamed to `intake-records` to reflect its multi-sourc
 - All existing email records MUST be backfilled with `intakeSource: "email"` during migration.
 - New SFTP records are created with `intakeSource: "sftp"` by the SFTP Logic App workflow.
 - Used by the dashboard to display source indicators and by the agent to branch processing logic.
+- `intakeSource` is NOT the partition key — see `partitionKey` below.
+
+#### Field: `partitionKey` (new, required)
+
+| Field | Type | Required | Format | Description |
+|---|---|---|---|---|
+| `partitionKey` | `string` | Yes | `{source}_{YYYY-MM}` | **Cosmos DB partition key**. Composite of source identifier + year-month. |
+
+**Values by source**:
+- Email: `{sender_domain}_{YYYY-MM}` — e.g., `partner-pe-firm.com_2026-03` (domain extracted from `from` field)
+- SFTP: `{sftp_username}_{YYYY-MM}` — e.g., `sftp-partner-A_2026-03` (username from SFTP connection parameter)
+
+**Notes**:
+- Immutable once set — never changes after document creation.
+- Provides natural tenant-per-month data distribution, enabling efficient time-range and source-scoped queries.
+- SFTP dedup point-reads use the known SFTP username + current year-month as partition key value. Dedup is scoped to the same month; cross-month re-deliveries are treated as new files.
+- All existing email records MUST have `partitionKey` computed (from sender domain + `receivedAt` month) during migration.
 
 #### SFTP-specific fields (new, present only when `intakeSource: "sftp"`)
 
@@ -41,7 +61,11 @@ The `emails` container is renamed to `intake-records` to reflect its multi-sourc
 | `fileType` | `string` | Yes | File extension: `"csv"`, `"xlsx"`, `"xls"`, `"pdf"` |
 | `fileSize` | `number` | Yes | File size in bytes |
 | `sftpPath` | `string` | Yes | Full path on the SFTP server (e.g., `"/inbox/report-q4.pdf"`) |
-| `contentHash` | `string` | Yes | MD5 hash of file content for duplicate detection |
+| `contentHash` | `string` | Yes | MD5 hash of file content from `body('Upload_to_blob')?['ContentMD5']` |
+| `version` | `number` | Yes | Document version, starts at 1. Incremented on content updates (same path, different hash). |
+| `deliveryCount` | `number` | Yes | Total times this file path was delivered (including true duplicates). |
+| `deliveryHistory` | `object[]` | Yes | Array of `{deliveredAt, contentHash, action}` entries tracking every delivery. |
+| `lastDeliveredAt` | `string` (ISO 8601) | Yes | Timestamp of most recent delivery. |
 | `account` | `string` | Conditional | PE fund company name (parsed from filename). Present when filename matches convention. |
 | `fund` | `string` | Conditional | PE fund name (parsed from filename). Present when filename matches convention. |
 | `docType` | `string` | Conditional | Document type (parsed from filename, e.g., `"CapitalCall"`, `"NAVReport"`). Present when filename matches convention. |
@@ -63,9 +87,10 @@ The `emails` container is renamed to `intake-records` to reflect its multi-sourc
 
 | Field | Type | Required | Source | Description |
 |---|---|---|---|---|
-| `id` | `string` | Yes | Both | Unique identifier (email: Graph API message ID, SFTP: generated UUID) |
-| `intakeSource` | `string` | Yes | Both | `"email"` or `"sftp"` |
-| `status` | `string` | Yes | Both | Partition key. Values: `"received"`, `"processing"`, `"classified"`, `"archived"`, `"discarded"`, `"needs_review"`, `"triaged"`, `"error"` |
+| `id` | `string` | Yes | Both | Unique identifier (email: Graph API message ID, SFTP: `base64(sftpPath)` — doubles as dedup key) |
+| `partitionKey` | `string` | Yes | Both | **Partition key**. Composite: `{source}_{YYYY-MM}`. Email: `{sender_domain}_{YYYY-MM}`, SFTP: `{sftp_username}_{YYYY-MM}` |
+| `intakeSource` | `string` | Yes | Both | Discriminator: `"email"` or `"sftp"` |
+| `status` | `string` | Yes | Both | Processing status. Values: `"received"`, `"processing"`, `"classified"`, `"archived"`, `"discarded"`, `"needs_review"`, `"triaged"`, `"error"` |
 | `receivedAt` | `string` (ISO 8601) | Yes | Both | When the record was ingested |
 | `processedAt` | `string` (ISO 8601) | No | Both | When processing completed |
 | `classification` | `object` | No | Both | Classification result (null for CSV/Excel, null in triage-only mode) |
@@ -94,7 +119,8 @@ The `emails` container is renamed to `intake-records` to reflect its multi-sourc
 
 ```json
 {
-  "id": "sftp-a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "id": "L2luYm94L0hvcml6b25DYXBpdGFsX0dyb3d0aEZ1bmRJSUlfQ2FwaXRhbENhbGxfUTROb3RpY2VfMjAyNjAzMDlfMjAyNjA0MDEucGRm",
+  "partitionKey": "partnerreader_2026-03",
   "intakeSource": "sftp",
   "status": "received",
   "receivedAt": "2026-03-09T14:30:00Z",
@@ -103,6 +129,16 @@ The `emails` container is renamed to `intake-records` to reflect its multi-sourc
   "fileSize": 245780,
   "sftpPath": "/inbox/HorizonCapital_GrowthFundIII_CapitalCall_Q4Notice_20260309_20260401.pdf",
   "contentHash": "d41d8cd98f00b204e9800998ecf8427e",
+  "version": 1,
+  "deliveryCount": 1,
+  "deliveryHistory": [
+    {
+      "deliveredAt": "2026-03-09T14:30:00Z",
+      "contentHash": "d41d8cd98f00b204e9800998ecf8427e",
+      "action": "new"
+    }
+  ],
+  "lastDeliveredAt": "2026-03-09T14:30:00Z",
   "blobPath": "/attachments/sftp-a1b2c3d4/HorizonCapital_GrowthFundIII_CapitalCall_Q4Notice_20260309_20260401.pdf",
   "account": "HorizonCapital",
   "fund": "GrowthFundIII",
@@ -125,7 +161,8 @@ The `emails` container is renamed to `intake-records` to reflect its multi-sourc
 
 ```json
 {
-  "id": "sftp-a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "id": "L2luYm94L0hvcml6b25DYXBpdGFsX0dyb3d0aEZ1bmRJSUlfQ2FwaXRhbENhbGxfUTROb3RpY2VfMjAyNjAzMDlfMjAyNjA0MDEucGRm",
+  "partitionKey": "partnerreader_2026-03",
   "intakeSource": "sftp",
   "status": "classified",
   "receivedAt": "2026-03-09T14:30:00Z",
@@ -134,6 +171,16 @@ The `emails` container is renamed to `intake-records` to reflect its multi-sourc
   "fileSize": 245780,
   "sftpPath": "/inbox/HorizonCapital_GrowthFundIII_CapitalCall_Q4Notice_20260309_20260401.pdf",
   "contentHash": "d41d8cd98f00b204e9800998ecf8427e",
+  "version": 1,
+  "deliveryCount": 1,
+  "deliveryHistory": [
+    {
+      "deliveredAt": "2026-03-09T14:30:00Z",
+      "contentHash": "d41d8cd98f00b204e9800998ecf8427e",
+      "action": "new"
+    }
+  ],
+  "lastDeliveredAt": "2026-03-09T14:30:00Z",
   "blobPath": "/attachments/sftp-a1b2c3d4/HorizonCapital_GrowthFundIII_CapitalCall_Q4Notice_20260309_20260401.pdf",
   "account": "HorizonCapital",
   "fund": "GrowthFundIII",
@@ -173,7 +220,8 @@ The `emails` container is renamed to `intake-records` to reflect its multi-sourc
 
 ```json
 {
-  "id": "sftp-b2c3d4e5-f6a7-8901-bcde-f23456789012",
+  "id": "L2luYm94L0hvcml6b25DYXBpdGFsX0dyb3d0aEZ1bmRJSUlfTkFWUmVwb3J0X01hcmNoTkFWXzIwMjYwMzA5XzIwMjYwMzAxLmNzdg==",
+  "partitionKey": "partnerreader_2026-03",
   "intakeSource": "sftp",
   "status": "archived",
   "receivedAt": "2026-03-09T15:00:00Z",
@@ -182,6 +230,16 @@ The `emails` container is renamed to `intake-records` to reflect its multi-sourc
   "fileSize": 12450,
   "sftpPath": "/inbox/HorizonCapital_GrowthFundIII_NAVReport_MarchNAV_20260309_20260301.csv",
   "contentHash": "e99a18c428cb38d5f260853678922e03",
+  "version": 1,
+  "deliveryCount": 1,
+  "deliveryHistory": [
+    {
+      "deliveredAt": "2026-03-09T15:00:00Z",
+      "contentHash": "e99a18c428cb38d5f260853678922e03",
+      "action": "new"
+    }
+  ],
+  "lastDeliveredAt": "2026-03-09T15:00:00Z",
   "blobPath": "/attachments/sftp-b2c3d4e5/HorizonCapital_GrowthFundIII_NAVReport_MarchNAV_20260309_20260301.csv",
   "account": "HorizonCapital",
   "fund": "GrowthFundIII",
@@ -206,6 +264,7 @@ The `emails` container is renamed to `intake-records` to reflect its multi-sourc
 ```json
 {
   "id": "AAMkADI5...",
+  "partitionKey": "example.com_2026-02",
   "intakeSource": "email",
   "emailId": "AAMkADI5...",
   "status": "classified",
