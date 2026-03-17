@@ -263,16 +263,16 @@ class CosmosDBTools:
                 pipeline_mode = classification_details.get("pipelineMode", "full")
                 if pipeline_mode == "triage-only":
                     doc["status"] = "processed"
-                    doc["queue"] = classification_details.get("targetQueue", "triage-complete")
+                    doc["queue"] = classification_details.get("targetQueue", os.environ.get("TRIAGE_COMPLETE_QUEUE", "triage-complete"))
                 elif classification == "Not PE Related":
                     doc["status"] = "discarded"
-                    doc["queue"] = "discarded"
+                    doc["queue"] = os.environ.get("DISCARDED_QUEUE", "discarded")
                 elif confidence_score >= 0.65:
                     doc["status"] = "classified"
-                    doc["queue"] = "archival-pending"
+                    doc["queue"] = os.environ.get("ARCHIVAL_PENDING_QUEUE", "archival-pending")
                 else:
                     doc["status"] = "needs_review"
-                    doc["queue"] = "human-review"
+                    doc["queue"] = os.environ.get("HUMAN_REVIEW_QUEUE", "human-review")
 
                 # Mark processing timestamp when final classification is written
                 doc["processedAt"] = datetime.utcnow().isoformat()

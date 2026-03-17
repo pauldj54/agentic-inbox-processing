@@ -40,9 +40,9 @@ SERVICEBUS_NAMESPACE = os.environ["SERVICEBUS_NAMESPACE"]
 # Queue names (simplified pipeline)
 QUEUE_NAMES = [
     "email-intake",      # Incoming emails
-    "discarded",         # Non-PE emails
-    "human-review",      # Low confidence (<65%)
-    "archival-pending",  # Ready for archival (>=65%)
+    os.environ.get("DISCARDED_QUEUE", "discarded"),         # Non-PE emails
+    os.environ.get("HUMAN_REVIEW_QUEUE", "human-review"),      # Low confidence (<65%)
+    os.environ.get("ARCHIVAL_PENDING_QUEUE", "archival-pending"),  # Ready for archival (>=65%)
 ]
 
 # Add triage-complete queue only in triage-only mode AND when using primary namespace

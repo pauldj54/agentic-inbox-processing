@@ -33,9 +33,9 @@ class QueueTools:
     
     # Queue names for the email processing pipeline (simplified)
     QUEUE_EMAIL_INTAKE = "email-intake"       # Incoming emails
-    QUEUE_DISCARDED = "discarded"             # Non-PE emails
-    QUEUE_HUMAN_REVIEW = "human-review"       # Low confidence (<65%) needs disambiguation
-    QUEUE_ARCHIVAL_PENDING = "archival-pending"  # Ready for archival (>=65% confidence)
+    QUEUE_DISCARDED = os.environ.get("DISCARDED_QUEUE", "discarded")             # Non-PE emails
+    QUEUE_HUMAN_REVIEW = os.environ.get("HUMAN_REVIEW_QUEUE", "human-review")       # Low confidence (<65%) needs disambiguation
+    QUEUE_ARCHIVAL_PENDING = os.environ.get("ARCHIVAL_PENDING_QUEUE", "archival-pending")  # Ready for archival (>=65% confidence)
     
     def __init__(
         self,

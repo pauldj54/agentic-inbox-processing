@@ -116,7 +116,7 @@
         "type": "Http",
         "inputs": {
           "method": "HEAD",
-          "uri": "https://@{parameters('storageAccountName')}.blob.core.windows.net@{body('Upload_to_blob')?['Path']}",
+          "uri": "https://@{parameters('storageAccountName')}.blob.core.windows.net/attachments/@{outputs('Generate_file_id')}/@{encodeUriComponent(triggerOutputs()?['headers']['x-ms-file-name'])}",
           "headers": {
             "x-ms-version": "2020-10-02"
           },
@@ -482,7 +482,7 @@
                 "tenant": "@{parameters('sharepointTenantId')}",
                 "audience": "https://graph.microsoft.com",
                 "clientId": "@{parameters('sharepointClientId')}",
-                "secret": "@{parameters(\x27sharepointClientSecret\x27)}"
+                "secret": "@{parameters('sharepointClientSecret')}"
               }
             },
             "description": "Uploads spreadsheet file to SharePoint via Graph API PUT at /{letter}/{Account}/{Fund}/{filename}."
@@ -590,35 +590,9 @@
         },
         "description": "Overrides run status to Succeeded after the new-file processing path completes. Required because Check_for_duplicate returns 404 (Failed action) for new files."
       },
-      "Copy_processed_file_to_processed": {
-        "runAfter": {
-          "Check_if_spreadsheet": [
-            "Succeeded"
-          ]
-        },
-        "type": "ApiConnection",
-        "inputs": {
-          "host": {
-            "connection": {
-              "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
-            }
-          },
-          "method": "post",
-          "headers": {
-            "ReadFileMetadataFromServer": true
-          },
-          "path": "/datasets/default/copyFile",
-          "queries": {
-            "source": "@{parameters('sftpFolderPath')}@{triggerOutputs()?['headers']['x-ms-file-name']}",
-            "destination": "@{parameters('sftpArchivePath')}@{triggerOutputs()?['headers']['x-ms-file-name']}",
-            "overwrite": true,
-            "queryParametersSingleEncoded": true
-          }
-        }
-      },
       "Delete_file": {
         "runAfter": {
-          "Copy_processed_file_to_processed": [
+          "Check_if_spreadsheet": [
             "Succeeded"
           ]
         },
@@ -634,7 +608,8 @@
             "SkipDeleteIfFileNotFoundOnServer": false
           },
           "path": "/datasets/default/files/@{encodeURIComponent(encodeURIComponent(triggerOutputs()['headers']['x-ms-file-id']))}"
-        }
+        },
+        "description": "Deletes the original file from SFTP /in/ after successful processing. Uses file ID (not path) to avoid UTF-8 filename encoding issues. File content is already archived in blob storage."
       }
     },
     "outputs": {}

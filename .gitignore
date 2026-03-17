@@ -160,3 +160,6 @@ Thumbs.db
 
 # Documentation (internal/private)
 docs/
+
+deploy_payload.json
+sp-connection.json
