@@ -27,9 +27,10 @@ if env_file.exists():
 # Queue names used in the workflow
 QUEUE_NAMES = [
     "email-intake",
-    "discarded",
-    "human-review",
-    "archival-pending",
+    os.environ.get("DISCARDED_QUEUE", "discarded"),
+    os.environ.get("HUMAN_REVIEW_QUEUE", "human-review"),
+    os.environ.get("ARCHIVAL_PENDING_QUEUE", "archival-pending"),
+    os.environ.get("TRIAGE_COMPLETE_QUEUE", "triage-complete"),
 ]
 
 

@@ -43,7 +43,12 @@ print("=" * 60)
 namespace = os.environ["SERVICEBUS_NAMESPACE"]
 sb = ServiceBusClient(f"{namespace}.servicebus.windows.net", credential=credential)
 
-queues = ["email-intake", "discarded", "human-review", "archival-pending"]
+queues = [
+    "email-intake",
+    os.environ.get("DISCARDED_QUEUE", "discarded"),
+    os.environ.get("HUMAN_REVIEW_QUEUE", "human-review"),
+    os.environ.get("ARCHIVAL_PENDING_QUEUE", "archival-pending"),
+]
 with sb:
     for q in queues:
         try:

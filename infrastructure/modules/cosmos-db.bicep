@@ -59,17 +59,17 @@ resource database 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases@2024-05-15
 }
 
 // ----------------------------------------------------------------------------
-// Container: emails
-// Main container for email processing records
+// Container: intake-records
+// Main container for intake processing records (email + SFTP sources)
 // ----------------------------------------------------------------------------
-resource emailsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2024-05-15' = {
+resource intakeRecordsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2024-05-15' = {
   parent: database
-  name: 'emails'
+  name: 'intake-records'
   properties: {
     resource: {
-      id: 'emails'
+      id: 'intake-records'
       partitionKey: {
-        paths: ['/status'] // Partition by status for efficient queries
+        paths: ['/partitionKey'] // Composite: {source}_{YYYY-MM} for tenant-per-month distribution
         kind: 'Hash'
       }
       indexingPolicy: {
@@ -85,12 +85,20 @@ resource emailsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/con
         ]
         compositeIndexes: [
           [
-            { path: '/status', order: 'ascending' }
+            { path: '/partitionKey', order: 'ascending' }
             { path: '/receivedAt', order: 'descending' }
           ]
           [
             { path: '/confidenceLevel', order: 'ascending' }
             { path: '/receivedAt', order: 'descending' }
+          ]
+          [
+            { path: '/intakeSource', order: 'ascending' }
+            { path: '/status', order: 'ascending' }
+          ]
+          [
+            { path: '/partitionKey', order: 'ascending' }
+            { path: '/status', order: 'ascending' }
           ]
         ]
       }

@@ -1,6 +1,6 @@
 # Agentic Inbox Processing
 
-An intelligent email classification system for Private Equity (PE) lifecycle events using Azure AI Agent Service. Automatically classifies incoming emails into 11 PE categories with multi-language support (English/French) and routes them based on classification confidence.
+An intelligent document classification system for Private Equity (PE) lifecycle events using Azure AI Agent Service. Ingests documents from **email** (via Logic App + Microsoft Graph) and **SFTP** (via Logic App + SFTP connector), classifies them into 11 PE categories with multi-language support (English/French), and routes them based on classification confidence.
 
 ## Table of Contents
 
@@ -22,55 +22,86 @@ An intelligent email classification system for Private Equity (PE) lifecycle eve
 ## Overview
 
 This solution provides:
-- **Automated Classification**: Uses Azure AI Agent Service (GPT-4o) to classify incoming PE emails
+- **Dual Intake**: Ingests documents from email (Microsoft Graph) and SFTP (polling trigger)
+- **Automated Classification**: Uses Azure AI Agent Service (GPT-4o) to classify incoming PE documents
 - **Multi-step Processing**: 2-stage classification (relevance check → detailed categorization)
 - **Attachment Analysis**: Extracts text from PDF attachments using Azure Document Intelligence
-- **Download-Link Intake**: Detects download links in email bodies, downloads the documents, and stores them in Azure Blob Storage using the same convention as regular attachments
+- **Download-Link Intake**: Detects download links in email bodies, downloads the documents, and stores them in Azure Blob Storage
+- **SFTP File Ingestion**: Polls SFTP `/in/` folder, backs up to blob storage, routes spreadsheets to SharePoint and PDFs to classification agent
+- **Content Hash Deduplication**: Detects duplicate uploads and content updates using blob Content-MD5 hashes with 3-way routing (new / duplicate / update)
 - **Entity Extraction**: Automatically extracts fund names, PE company names, amounts, and dates
 - **Confidence-based Routing**: Routes emails to different queues based on classification confidence
 - **Pipeline Configuration**: Switch between full classification pipeline and triage-only mode via environment variable
-- **Web Dashboard**: Real-time monitoring of processing status, queue contents, pipeline mode indicator, and link-sourced attachment indicators
+- **Configurable Queue Names**: All queue names are configurable via environment variables
+- **Web Dashboard**: Real-time monitoring of processing status, queue contents, pipeline mode indicator, delivery tracking for SFTP records
 - **Deduplication**: Prevents duplicate PE events using intelligent hashing
 
 ## Architecture
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────────────────────┐
-│   Email Source  │────▶│  Logic App      │────▶│  Service Bus (email-intake)     │
-│   (Outlook/API) │     │  (Ingestion)    │     └─────────────┬───────────────────┘
-└─────────────────┘     └─────────────────┘                   │
-                                                              ▼
-                                              ┌─────────────────────────────────┐
-                                              │  Email Classification Agent     │
-                                              │  (Azure AI Agent Service)       │
-                                              │                                 │
-                                              │  Step 1: Relevance Check        │
-                                              │  Step 2: Route by Pipeline Mode │
-                                              └─────────────┬───────────────────┘
-                                                            │
-                                         ┌──────────────────┴──────────────────┐
-                                         │                                     │
-                                    PIPELINE_MODE                         PIPELINE_MODE
-                                      = "full"                            = "triage-only"
-                                         │                                     │
-                                         ▼                                     ▼
-                              ┌─────────────────────┐           ┌─────────────────────────┐
-                              │  Step 3: Classify    │           │  Send to triage-complete │
-                              │  Step 4: Extract     │           │  queue (skip classify)   │
-                              └──────────┬──────────┘           └────────────┬────────────┘
-                                         │                                   │
-          ┌──────────────────────────────┼────────────────────┐              ▼
-          │                              │                    │   ┌─────────────────────┐
-          ▼                              ▼                    ▼   │  triage-complete     │
-┌─────────────────────┐   ┌─────────────────────┐  ┌────────────┐│  (for IDP / downstream)│
-│  discarded          │   │  archival-pending   │  │human-review││                       │
-│  (Not PE related)   │   │  (≥65% confidence)  │  │(<65% conf.)│└───────────────────────┘
-└─────────────────────┘   └─────────────────────┘  └────────────┘
-                                         │
-                                         ▼
-                              ┌─────────────────────────────────┐
-                              │  Cosmos DB (Audit & Storage)    │
-                              └─────────────────────────────────┘
+                    ┌─── INTAKE SOURCES ───┐
+                    │                      │
+  ┌─────────────────┤                      ├─────────────────────┐
+  │                 │                      │                     │
+  ▼                 │                      │                     ▼
+┌───────────────┐   │                      │   ┌──────────────────────────────┐
+│ Email Source  │   │                      │   │ SFTP Server (/in/)           │
+│ (Outlook/API) │   │                      │   └──────────────┬───────────────┘
+└──────┬────────┘   │                      │                  │
+       │            │                      │                  ▼
+       ▼            │                      │   ┌──────────────────────────────┐
+┌───────────────┐   │                      │   │ Logic App (SFTP Ingestion)   │
+│ Logic App     │   │                      │   │                              │
+│ (Email)       │   │                      │   │ 1. Download file content     │
+│               │   │                      │   │ 2. Upload to Blob Storage    │
+│ Graph API     │   │                      │   │ 3. Get Content-MD5 hash      │
+│ ingestion     │   │                      │   │ 4. 3-way dedup check         │
+└──────┬────────┘   │                      │   │ 5. Route by file type        │
+       │            │                      │   │ 6. Delete from SFTP          │
+       │            │                      │   └──────┬────────┬──────────────┘
+       │            │                      │          │        │
+       ▼            │                      │      CSV/XLS     PDF
+┌──────────────┐    │                      │          │        │
+│ Service Bus  │◀───┘                      └──────────│────────┘
+│ email-intake │                                      │
+└──────┬───────┘                                      ▼
+       │                                   ┌──────────────────┐
+       ▼                                   │ SharePoint       │
+┌──────────────────────────────────┐       │ (Graph API PUT)  │
+│ Email Classification Agent       │       └──────────────────┘
+│ (Azure AI Agent Service)         │
+│                                  │
+│ Step 1: Relevance Check          │
+│ Step 2: Route by Pipeline Mode   │
+└──────────────┬───────────────────┘
+               │
+    ┌──────────┴──────────┐
+    │                     │
+PIPELINE_MODE        PIPELINE_MODE
+  = "full"            = "triage-only"
+    │                     │
+    ▼                     ▼
+┌─────────────┐  ┌─────────────────────┐
+│ Classify    │  │ triage-complete     │
+│ Extract     │  │ (for IDP /          │
+└──────┬──────┘  │  downstream)        │
+       │         └─────────────────────┘
+       │
+  ┌────┼─────────────┐
+  │    │             │
+  ▼    ▼             ▼
+┌────┐┌────────────┐┌────────────┐
+│disc││archival-   ││human-      │
+│ard-││pending     ││review      │
+│ed  ││(≥65% conf.)││(<65% conf.)│
+└────┘└──────┬─────┘└────────────┘
+             │
+             ▼
+    ┌──────────────────────────┐
+    │ Cosmos DB                │
+    │ (intake-records)         │
+    │ PK: /partitionKey        │
+    └──────────────────────────┘
 ```
 
 ## Prerequisites
@@ -105,19 +136,19 @@ Create the following Azure services (or use the provided Bicep templates in `/in
 - Create a Cosmos DB account (NoSQL API)
 - Create a database named `email-processing`
 - Create containers:
-  - `emails` (partition key: `/id`)
-  - `pe-events` (partition key: `/id`)
-  - `audit-logs` (partition key: `/emailId`)
+  - `intake-records` (partition key: `/partitionKey`)
+    - Email records: partition key = `{sender_domain}_{YYYY-MM}`
+    - SFTP records: partition key = `{sftp_username}_{YYYY-MM}`
 
 ### 4. Azure Document Intelligence (Optional)
 - Create a Document Intelligence resource
 - Note the endpoint URL (for PDF attachment processing)
 
 ### 5. Azure Storage Account
-- Create a Storage Account (for storing downloaded attachments from email links)
+- Create a Storage Account (for blob backup of ingested documents)
 - Create a blob container named `attachments`
 - Note the storage account name
-- Ensure your identity has `Storage Blob Data Contributor` role
+- Ensure your identity (and the SFTP Logic App managed identity) has `Storage Blob Data Owner` role
 
 ### 6. Role Assignments
 Ensure your Azure identity has the following roles:
@@ -196,7 +227,7 @@ COSMOS_DATABASE=email-processing
 # Azure Document Intelligence (optional - for PDF attachments)
 DOCUMENT_INTELLIGENCE_ENDPOINT=https://<your-doc-intel>.cognitiveservices.azure.com/
 
-# Azure Storage Account (for link-downloaded attachments)
+# Azure Storage Account (for blob backup of ingested documents)
 STORAGE_ACCOUNT_NAME=<your-storage-account-name>
 
 # Microsoft Graph API (optional - for direct mailbox access)
@@ -208,6 +239,11 @@ STORAGE_ACCOUNT_NAME=<your-storage-account-name>
 PIPELINE_MODE=full                        # "full" (default) or "triage-only"
 TRIAGE_COMPLETE_QUEUE=triage-complete      # Queue name for triage-only output
 # TRIAGE_COMPLETE_SB_NAMESPACE=<external>  # Optional: external Service Bus namespace
+
+# Queue Names (override defaults if needed)
+HUMAN_REVIEW_QUEUE=human-review
+ARCHIVAL_PENDING_QUEUE=archival-pending
+DISCARDED_QUEUE=discarded
 ```
 
 ### Step 2: Validate Configuration
@@ -368,21 +404,25 @@ agentic-inbox-processing/
 │   ├── modules/                      # Bicep modules
 │   └── parameters/                   # Environment parameters
 ├── logic-apps/                    # Logic App workflows
-│   └── email-ingestion/
+│   ├── email-ingestion/               # Email intake (Graph API trigger)
+│   └── sftp-file-ingestion/           # SFTP intake (polling trigger)
 ├── tests/                         # Automated tests
 │   ├── unit/                          # Unit tests
 │   │   ├── test_link_download_tool.py     # Link download tool tests
 │   │   └── test_pipeline_config.py        # Pipeline mode tests
 │   └── integration/                   # Integration tests
-│       └── test_link_download_flow.py     # End-to-end link download flow
+│       ├── test_link_download_flow.py     # End-to-end link download flow
+│       └── test_sftp_intake_flow.py       # SFTP intake integration tests
 ├── specs/                         # Feature specifications
 │   ├── 001-download-link-intake/      # Download-link intake spec
-│   └── 002-pipeline-config/           # Pipeline configuration spec
+│   ├── 002-pipeline-config/           # Pipeline configuration spec
+│   └── 003-sftp-intake/               # SFTP file ingestion spec
 ├── utils/                         # Utility scripts
 │   ├── diagnose.py                   # Configuration checker
 │   ├── test_connectivity.py          # Connection tests
 │   ├── purge_queues.py               # Queue maintenance
-│   └── clear_cosmos_emails.py        # Data cleanup
+│   ├── clear_cosmos_emails.py        # Data cleanup
+│   └── migrate_container.py          # Cosmos DB partition key migration
 ├── requirements.txt               # Python dependencies
 ├── pyproject.toml                 # Project metadata & pytest config
 ├── startup.sh                     # Azure App Service startup
@@ -410,13 +450,13 @@ The system classifies emails into these Private Equity lifecycle events:
 
 ## Service Bus Queues
 
-| Queue | Purpose | Routing Condition |
-|-------|---------|-------------------|
-| `email-intake` | Incoming emails from Logic App | Entry point |
-| `discarded` | Non-PE related emails | Not PE Related classification |
-| `archival-pending` | Successfully classified emails | Confidence ≥ 65% |
-| `human-review` | Uncertain classifications | Confidence < 65% |
-| `triage-complete` | Triage-only mode output | `PIPELINE_MODE=triage-only` |
+| Queue | Env Variable | Default | Routing Condition |
+|-------|-------------|---------|-------------------|
+| email-intake | — | `email-intake` | Entry point (emails + SFTP PDFs) |
+| discarded | `DISCARDED_QUEUE` | `discarded` | Not PE Related classification |
+| archival-pending | `ARCHIVAL_PENDING_QUEUE` | `archival-pending` | Confidence ≥ 65% |
+| human-review | `HUMAN_REVIEW_QUEUE` | `human-review` | Confidence < 65% |
+| triage-complete | `TRIAGE_COMPLETE_QUEUE` | `triage-complete` | `PIPELINE_MODE=triage-only` |
 
 ## PE Event Deduplication
 
@@ -444,6 +484,64 @@ The system automatically detects download links in email bodies and downloads th
 ### Dashboard Indicators
 The web dashboard shows a link icon next to attachments that were sourced from download links (vs. traditional email attachments), making it easy to identify the origin of each document.
 
+## SFTP File Ingestion
+
+The system ingests documents from an SFTP server via a Logic App that polls the `/in/` folder. Files are backed up to Azure Blob Storage, deduplicated using content hashes, and routed based on file type.
+
+### Workflow Steps
+
+| Step | Action | Description |
+|------|--------|-------------|
+| 1 | Get file content | Downloads the file from the SFTP server |
+| 2 | Generate file ID | Creates a unique `sftp-{guid}` identifier |
+| 3 | Parse filename | Extracts file extension and metadata parts (Account, Fund, DocType, etc.) |
+| 4 | Upload to blob | Backs up file to `/attachments/{fileId}/{filename}` |
+| 5 | Get blob MD5 | HTTP HEAD to Blob REST API for `Content-MD5` hash |
+| 6 | Compute dedup key | `base64(sftpPath)` for O(1) Cosmos DB point-reads |
+| 7 | 3-way dedup check | New file → create record; Same hash → duplicate; Different hash → update |
+| 8 | Route by file type | CSV/XLS/XLSX → SharePoint; PDF → Service Bus for classification |
+| 9 | Delete from SFTP | Removes the file from `/in/` using file ID (not path, to avoid UTF-8 issues) |
+
+### Content Hash Deduplication
+
+The SFTP workflow uses blob `Content-MD5` for 3-way dedup routing:
+
+| Scenario | Cosmos DB Lookup | Content Hash Match | Action |
+|----------|-----------------|-------------------|--------|
+| **New file** | 404 (not found) | N/A | Create intake record, route to queue |
+| **Duplicate** | Found | Same as stored | Increment `deliveryCount`, append to `deliveryHistory`, terminate |
+| **Update** | Found | Different | Increment `version` + `deliveryCount`, update `contentHash` and `blobPath` |
+
+### Delivery Tracking Fields
+
+Each SFTP intake record in Cosmos DB includes:
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| `contentHash` | Blob Content-MD5 (base64) | `Lyaf8xLRAAIvloNxXOuaOQ==` |
+| `version` | Content version (increments on update) | `2` |
+| `deliveryCount` | Total deliveries (new + duplicate + update) | `3` |
+| `deliveryHistory` | Array of delivery events | `[{deliveredAt, contentHash, action}]` |
+| `lastDeliveredAt` | Timestamp of most recent delivery | `2026-03-17T15:31:22Z` |
+
+### File Type Routing
+
+| File Type | Destination | Method |
+|-----------|------------|--------|
+| CSV, XLS, XLSX | SharePoint document library | Graph API PUT (organized by `/{Letter}/{Account}/{Fund}/`) |
+| PDF | Service Bus `email-intake` queue | Classification agent processes it |
+| Other | Logged and skipped | File remains in blob storage |
+
+### SFTP Filename Convention
+
+Files should follow the delimiter-separated naming convention (default delimiter: `_`):
+
+```
+{Account}_{Fund}_{DocType}_{DocName}_{PublishedDate}_{EffectiveDate}.{ext}
+```
+
+Example: `AcmeCorp_FundXV_CapitalCall_Q1Notice_2026-01-15_2026-01-30.pdf`
+
 ## Pipeline Configuration
 
 The agent supports two pipeline modes, controlled by the `PIPELINE_MODE` environment variable:
@@ -465,6 +563,9 @@ The agent supports two pipeline modes, controlled by the `PIPELINE_MODE` environ
 | `PIPELINE_MODE` | No | `full` | `full` or `triage-only` |
 | `TRIAGE_COMPLETE_QUEUE` | No | `triage-complete` | Queue name for triage-only output |
 | `TRIAGE_COMPLETE_SB_NAMESPACE` | No | *(unset)* | Optional external Service Bus namespace. If unset, the primary namespace is used. |
+| `HUMAN_REVIEW_QUEUE` | No | `human-review` | Queue name for low-confidence classifications |
+| `ARCHIVAL_PENDING_QUEUE` | No | `archival-pending` | Queue name for classified emails (≥65%) |
+| `DISCARDED_QUEUE` | No | `discarded` | Queue name for non-PE emails |
 
 ### Integration Pattern
 

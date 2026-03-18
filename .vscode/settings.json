@@ -9,6 +9,15 @@
     "chat.tools.terminal.autoApprove": {
         ".specify/scripts/bash/": true,
         ".specify/scripts/powershell/": true
+    },
+    "chat.agentSkillsLocations": {
+        ".github/skills": true,
+        ".agents/skills": true,
+        ".claude/skills": true,
+        "~/.copilot/skills": true,
+        "~/.agents/skills": true,
+        "~/.claude/skills": true,
+        "~/.vscode/extensions/synapsevscode.synapse-1.21.0/copilot/skills": true
     }
 }
 

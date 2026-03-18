@@ -12,3 +12,6 @@ param tags = {
   managedBy: 'bicep'
   costCenter: 'operations'
 }
+
+// Key Vault (pre-provisioned, holds sftp-private-key and sharepoint-client-secret)
+param keyVaultName = 'kv-zava-prod'

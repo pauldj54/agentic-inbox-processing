@@ -33,6 +33,8 @@
         .badge-pipeline-full { background-color: #DFF6DD; color: #107C10; }
         .badge-pipeline-triage { background-color: #FFF4CE; color: #8A6914; }
         .badge-triage-queue { background-color: #E5F1FB; color: #0078D4; }
+        .badge-source-email { background-color: #E5F1FB; color: #0078D4; }
+        .badge-source-sftp { background-color: #DFF6DD; color: #107C10; }
     </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
@@ -112,10 +114,12 @@
                         <thead class="bg-gray-50">
                             <tr>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Source</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Received At</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">From</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Subject</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">📎</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Delivery</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Preview</th>
                             </tr>
                         </thead>
@@ -143,14 +147,33 @@
                                             {% endif %}
                                         </div>
                                     </td>
+                                    <td class="px-4 py-3 whitespace-nowrap">
+                                        {% set source = email.intakeSource|default('email') %}
+                                        <span class="px-2 py-1 text-xs font-medium rounded-full badge-source-{{ source }}">
+                                            {% if source == 'sftp' %}📁 SFTP{% else %}📧 Email{% endif %}
+                                        </span>
+                                    </td>
                                     <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-600">
                                         {{ email.receivedAt|format_datetime }}
                                     </td>
                                     <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-900">
-                                        {{ email.from|truncate_text(30) }}
+                                        {% if email.intakeSource == 'sftp' %}
+                                            <span class="text-gray-400 text-xs">SFTP</span>
+                                        {% else %}
+                                            {{ email.from|truncate_text(30) }}
+                                        {% endif %}
                                     </td>
                                     <td class="px-4 py-3 text-sm text-gray-900 max-w-xs truncate">
-                                        {{ email.subject|truncate_text(50) }}
+                                        {% if email.intakeSource == 'sftp' %}
+                                            <div class="flex items-center gap-1">
+                                                {% if email.fileType %}
+                                                <span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-100 text-gray-700 uppercase">{{ email.fileType }}</span>
+                                                {% endif %}
+                                                {{ email.originalFilename|default('—')|truncate_text(45) }}
+                                            </div>
+                                        {% else %}
+                                            {{ email.subject|truncate_text(50) }}
+                                        {% endif %}
                                     </td>
                                     <td class="px-4 py-3 whitespace-nowrap text-sm text-center">
                                         {% set att_count = email.attachmentsCount or 0 %}
@@ -168,14 +191,34 @@
                                             <span class="text-gray-400">—</span>
                                         {% endif %}
                                     </td>
+                                    <td class="px-4 py-3 whitespace-nowrap text-sm text-center">
+                                        {% if email.intakeSource == 'sftp' %}
+                                            {% set ver = email.version|default(1) %}
+                                            {% set dc = email.deliveryCount|default(1) %}
+                                            <div class="flex flex-col items-center gap-0.5">
+                                                <span class="px-1.5 py-0.5 text-xs font-medium rounded bg-blue-100 text-blue-700" title="Document version">v{{ ver }}</span>
+                                                {% if dc > 1 %}
+                                                <span class="text-xs text-gray-500" title="Delivered {{ dc }} times. Last: {{ email.lastDeliveredAt|format_datetime }}">{{ dc }}x</span>
+                                                {% endif %}
+                                            </div>
+                                        {% else %}
+                                            <span class="text-gray-400">—</span>
+                                        {% endif %}
+                                    </td>
                                     <td class="px-4 py-3 text-sm text-gray-500 max-w-md">
-                                        {{ email.emailBody|truncate_html(50) }}
+                                        {% if email.intakeSource == 'sftp' and email.sharepointPath %}
+                                            <span class="text-xs text-green-700" title="{{ email.sharepointPath }}">📂 {{ email.sharepointPath|truncate_text(50) }}</span>
+                                        {% elif email.intakeSource == 'sftp' %}
+                                            <span class="text-gray-400 text-xs">—</span>
+                                        {% else %}
+                                            {{ email.emailBody|truncate_html(50) }}
+                                        {% endif %}
                                     </td>
                                 </tr>
                                 {% endfor %}
                             {% else %}
                                 <tr>
-                                    <td colspan="6" class="px-4 py-8 text-center text-gray-500">
+                                    <td colspan="8" class="px-4 py-8 text-center text-gray-500">
                                         No emails found in the database.
                                     </td>
                                 </tr>

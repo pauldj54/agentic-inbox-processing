@@ -163,6 +163,8 @@
                     "method": "post",
                     "body": {
                         "id": "@{triggerBody()?['id']}",
+                        "intakeSource": "email",
+                        "partitionKey": "@{concat(replace(last(split(triggerBody()?['from'], '@')), '>', ''), '_', formatDateTime(triggerBody()?['receivedDateTime'], 'yyyy-MM'))}",
                         "status": "received",
                         "confidenceLevel": "pending",
                         "receivedAt": "@{triggerBody()?['receivedDateTime']}",
@@ -179,7 +181,7 @@
                     "headers": {
                         "x-ms-documentdb-is-upsert": true
                     },
-                    "path": "/v2/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('emails')}/docs"
+                    "path": "/v2/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('intake-records')}/docs"
                 },
                 "description": "Creates/updates email document in Cosmos DB with attachment count (after processing attachments)"
             },

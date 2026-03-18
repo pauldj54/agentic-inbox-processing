@@ -96,6 +96,14 @@ def load_environment():
     if not os.getenv("TRIAGE_COMPLETE_QUEUE"):
         os.environ["TRIAGE_COMPLETE_QUEUE"] = "triage-complete"
 
+    # Other queue names (with defaults)
+    if not os.getenv("HUMAN_REVIEW_QUEUE"):
+        os.environ["HUMAN_REVIEW_QUEUE"] = "human-review"
+    if not os.getenv("ARCHIVAL_PENDING_QUEUE"):
+        os.environ["ARCHIVAL_PENDING_QUEUE"] = "archival-pending"
+    if not os.getenv("DISCARDED_QUEUE"):
+        os.environ["DISCARDED_QUEUE"] = "discarded"
+
     # Optional external Service Bus namespace for triage-complete queue (no default)
 
 

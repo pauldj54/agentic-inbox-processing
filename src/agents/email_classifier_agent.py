@@ -27,6 +27,7 @@ from .classification_prompts import (
     FULL_CLASSIFICATION_SYSTEM_PROMPT,
     RELEVANCE_CHECK_USER_PROMPT,
     FULL_CLASSIFICATION_USER_PROMPT,
+    SFTP_CLASSIFICATION_USER_PROMPT,
     RELEVANCE_OUTPUT_SCHEMA,
     CLASSIFICATION_OUTPUT_SCHEMA,
     PE_CATEGORIES,
@@ -152,10 +153,18 @@ class EmailClassificationAgent:
             return None
         
         email_data = email_message.get("body", {})
-        # Try multiple field names for email ID (Logic App may use 'id' or 'emailId')
-        email_id = email_data.get("emailId") or email_data.get("id") or "unknown"
-        
-        logger.info(f"Processing email: {email_id[:30]}...")
+
+        # Detect intake source: "sftp" for SFTP-sourced files, default to "email"
+        intake_source = email_data.get("intakeSource", "email")
+
+        if intake_source == "sftp":
+            # SFTP-sourced PDF: use fileId as document ID
+            email_id = email_data.get("fileId") or email_data.get("id") or "unknown"
+            logger.info(f"Processing SFTP file: {email_id[:30]}...")
+        else:
+            # Email-sourced: use emailId or id
+            email_id = email_data.get("emailId") or email_data.get("id") or "unknown"
+            logger.info(f"Processing email: {email_id[:30]}...")
         
         # Log the start of processing
         self.cosmos_tools.log_classification_event(
@@ -168,54 +177,64 @@ class EmailClassificationAgent:
             # =====================================================
             # STEP 1: PE RELEVANCE CHECK (Binary: YES/NO)
             # =====================================================
-            # This is a binary decision based on email metadata + attachment names.
-            # - If NOT PE-relevant → route to discarded queue (end processing)
-            # - If PE-relevant → proceed to Step 2 (full classification)
-            relevance_result = await self._check_relevance(email_data)
+            # - For SFTP PDFs: always relevant (curated source), skip LLM call
+            # - For emails: binary decision based on metadata + attachment names
+            if intake_source == "sftp":
+                relevance_result = {
+                    "is_relevant": True,
+                    "confidence": 1.0,
+                    "reasoning": "SFTP-sourced PDF — auto-relevant (curated intake channel)",
+                    "initial_category": email_data.get("fileType", "Others")
+                }
+                logger.info("SFTP source → auto-relevant, skipping relevance check")
+            else:
+                relevance_result = await self._check_relevance(email_data)
             
             # OVERRIDE: If subject contains "PE" and (has attachments OR body mentions docs), force relevance
             # This handles cases where the model incorrectly marks PE emails as not relevant
-            subject = email_data.get("subject", "").lower()
-            body_text = email_data.get("bodyText", email_data.get("emailBody", "")).lower()
-            
-            # Extract plain text if HTML
-            if "<html" in body_text or "<body" in body_text:
-                body_text = extract_plain_text_from_html(body_text).lower()
-            
-            # Check for PE indicators in subject
-            subject_has_pe = any(term in subject for term in [
-                "pe ", "pe documents", "pe docs", "private equity", 
-                "capital call", "distribution", "appel de fonds"
-            ]) or subject.startswith("pe")
-            
-            # Check if we have attachments (properly parse string boolean)
-            has_attachments = parse_bool(email_data.get("hasAttachments", False))
-            attachment_count = email_data.get("attachmentCount", 0)
-            if isinstance(attachment_count, str):
-                try:
-                    attachment_count = int(attachment_count)
-                except ValueError:
-                    attachment_count = 0
-            
-            # Check if body mentions attachments
-            body_mentions_attachments = any(word in body_text for word in [
-                "attached", "document", "docs", "fichier", "pièce jointe", "enclosed"
-            ])
-            
-            # Override logic: if subject has PE and we have attachments or body mentions docs
-            should_override = (
-                not relevance_result.get("is_relevant", False) 
-                and subject_has_pe 
-                and (has_attachments or attachment_count > 0 or body_mentions_attachments)
-            )
-            
-            if should_override:
-                logger.warning(f"⚠️ OVERRIDE: Subject contains PE term, has_attachments={has_attachments}, "
-                             f"attachment_count={attachment_count}, body_mentions_docs={body_mentions_attachments}")
-                logger.warning(f"   Forcing relevance=true to allow full classification with attachments")
-                relevance_result["is_relevant"] = True
-                relevance_result["reasoning"] = f"OVERRIDE: {relevance_result.get('reasoning', '')} [Forced relevant: subject='{email_data.get('subject', '')}', hasAttachments={has_attachments}, attachmentCount={attachment_count}]"
-                relevance_result["initial_category"] = "Capital Call"  # Default guess
+            # Skip for SFTP-sourced records (no email subject/body available)
+            if intake_source != "sftp":
+                subject = email_data.get("subject", "").lower()
+                body_text = email_data.get("bodyText", email_data.get("emailBody", "")).lower()
+                
+                # Extract plain text if HTML
+                if "<html" in body_text or "<body" in body_text:
+                    body_text = extract_plain_text_from_html(body_text).lower()
+                
+                # Check for PE indicators in subject
+                subject_has_pe = any(term in subject for term in [
+                    "pe ", "pe documents", "pe docs", "private equity", 
+                    "capital call", "distribution", "appel de fonds"
+                ]) or subject.startswith("pe")
+                
+                # Check if we have attachments (properly parse string boolean)
+                has_attachments = parse_bool(email_data.get("hasAttachments", False))
+                attachment_count = email_data.get("attachmentCount", 0)
+                if isinstance(attachment_count, str):
+                    try:
+                        attachment_count = int(attachment_count)
+                    except ValueError:
+                        attachment_count = 0
+                
+                # Check if body mentions attachments
+                body_mentions_attachments = any(word in body_text for word in [
+                    "attached", "document", "docs", "fichier", "pièce jointe", "enclosed"
+                ])
+                
+                # Override logic: if subject has PE and we have attachments or body mentions docs
+                should_override = (
+                    not relevance_result.get("is_relevant", False) 
+                    and subject_has_pe 
+                    and (has_attachments or attachment_count > 0 or body_mentions_attachments)
+                )
+                
+                if should_override:
+                    logger.warning(f"⚠️ OVERRIDE: Subject contains PE term, has_attachments={has_attachments}, "
+                                 f"attachment_count={attachment_count}, body_mentions_docs={body_mentions_attachments}")
+                    logger.warning(f"   Forcing relevance=true to allow full classification with attachments")
+                    relevance_result["is_relevant"] = True
+                    relevance_result["reasoning"] = f"OVERRIDE: {relevance_result.get('reasoning', '')} [Forced relevant: subject='{email_data.get('subject', '')}', hasAttachments={has_attachments}, attachmentCount={attachment_count}]"
+                    relevance_result["initial_category"] = "Capital Call"  # Default guess
             
             # Log relevance check
             self.cosmos_tools.log_classification_event(
@@ -270,101 +289,111 @@ class EmailClassificationAgent:
             # =====================================================
             # STEP 1.5: DOWNLOAD LINKED DOCUMENTS (if any)
             # =====================================================
-            # Detect document download links in email body, fetch them,
-            # and add to attachmentPaths as {"path": ..., "source": "link"}
-            cosmos_doc = None  # Saved for attachment reconciliation later
-            try:
-                # Fetch full email body from Cosmos DB — the Service Bus message
-                # only contains bodyPreview (~255 chars) which may truncate URLs.
-                email_body_for_links = ""
-                cosmos_doc = self.cosmos_tools.get_email_document(email_id)
+            # Skip for SFTP-sourced records — file already in blob storage
+            cosmos_doc = None
+            if intake_source != "sftp":
+                # Detect document download links in email body, fetch them,
+                # and add to attachmentPaths as {"path": ..., "source": "link"}
+                try:
+                    # Fetch full email body from Cosmos DB — the Service Bus message
+                    # only contains bodyPreview (~255 chars) which may truncate URLs.
+                    email_body_for_links = ""
+                    cosmos_doc = self.cosmos_tools.get_email_document(email_id)
+                    if cosmos_doc:
+                        email_body_for_links = cosmos_doc.get("emailBody", "")
+                    if not email_body_for_links:
+                        # Fallback to Service Bus fields if Cosmos body unavailable
+                        email_body_for_links = email_data.get("bodyText", "") or email_data.get("emailBody", "")
+                    link_result = await self.link_download_tool.process_email_links(
+                        email_id=email_id,
+                        email_body=email_body_for_links,
+                    )
+
+                    if link_result.downloaded_files:
+                        logger.info(f"📎 Downloaded {len(link_result.downloaded_files)} linked document(s)")
+                        # Merge into attachmentPaths
+                        attachment_paths = email_data.get("attachmentPaths") or []
+                        for downloaded in link_result.downloaded_files:
+                            attachment_paths.append({
+                                "path": downloaded.path,
+                                "source": "link",
+                                "url": downloaded.url,
+                                "content_type": downloaded.content_type,
+                            })
+                        email_data["attachmentPaths"] = attachment_paths
+
+                        # Update hasAttachments and attachmentsCount (plural — matches Cosmos schema)
+                        email_data["hasAttachments"] = True
+                        current_count = email_data.get("attachmentsCount", 0)
+                        if isinstance(current_count, str):
+                            try:
+                                current_count = int(current_count)
+                            except ValueError:
+                                current_count = 0
+                        email_data["attachmentsCount"] = current_count + len(link_result.downloaded_files)
+
+                    if link_result.failures:
+                        logger.warning(f"⚠️ {len(link_result.failures)} link download(s) failed")
+
+                    # Stash results for Cosmos DB persistence (T010)
+                    email_data["_link_download_result"] = {
+                        "urls_detected": link_result.urls_detected,
+                        "urls_attempted": link_result.urls_attempted,
+                        "downloaded_count": len(link_result.downloaded_files),
+                        "failure_count": len(link_result.failures),
+                        "failures": [
+                            {
+                                "url": f.url,
+                                "error": f.error,
+                                "attempted_at": f.attempted_at,
+                                "error_type": f.error_type,
+                                "http_status": f.http_status,
+                            }
+                            for f in link_result.failures
+                        ],
+                    }
+
+                    self.cosmos_tools.log_classification_event(
+                        email_id=email_id,
+                        event_type="link_download_complete",
+                        details=email_data["_link_download_result"],
+                    )
+                except Exception as e:
+                    logger.error(f"Error during link download pre-processing: {e}", exc_info=True)
+                    # Don't block email processing — continue without downloaded links
+
+                # ── Reconcile attachment info from Cosmos (authoritative source) ──
+                # The Logic App writes attachment paths to Cosmos before sending to
+                # the intake queue, so Cosmos may have richer data than the queue msg.
                 if cosmos_doc:
-                    email_body_for_links = cosmos_doc.get("emailBody", "")
-                if not email_body_for_links:
-                    # Fallback to Service Bus fields if Cosmos body unavailable
-                    email_body_for_links = email_data.get("bodyText", "") or email_data.get("emailBody", "")
-                link_result = await self.link_download_tool.process_email_links(
-                    email_id=email_id,
-                    email_body=email_body_for_links,
-                )
-
-                if link_result.downloaded_files:
-                    logger.info(f"📎 Downloaded {len(link_result.downloaded_files)} linked document(s)")
-                    # Merge into attachmentPaths
-                    attachment_paths = email_data.get("attachmentPaths") or []
-                    for downloaded in link_result.downloaded_files:
-                        attachment_paths.append({
-                            "path": downloaded.path,
-                            "source": "link",
-                            "url": downloaded.url,
-                            "content_type": downloaded.content_type,
-                        })
-                    email_data["attachmentPaths"] = attachment_paths
-
-                    # Update hasAttachments and attachmentsCount (plural — matches Cosmos schema)
-                    email_data["hasAttachments"] = True
-                    current_count = email_data.get("attachmentsCount", 0)
-                    if isinstance(current_count, str):
+                    cosmos_att_paths = cosmos_doc.get("attachmentPaths") or []
+                    email_att_paths = email_data.get("attachmentPaths") or []
+                    if len(cosmos_att_paths) > len(email_att_paths):
+                        email_data["attachmentPaths"] = cosmos_att_paths
+                    cosmos_att_count = cosmos_doc.get("attachmentsCount", 0)
+                    email_att_count = email_data.get("attachmentsCount", 0)
+                    if isinstance(email_att_count, str):
                         try:
-                            current_count = int(current_count)
+                            email_att_count = int(email_att_count)
                         except ValueError:
-                            current_count = 0
-                    email_data["attachmentsCount"] = current_count + len(link_result.downloaded_files)
-
-                if link_result.failures:
-                    logger.warning(f"⚠️ {len(link_result.failures)} link download(s) failed")
-
-                # Stash results for Cosmos DB persistence (T010)
-                email_data["_link_download_result"] = {
-                    "urls_detected": link_result.urls_detected,
-                    "urls_attempted": link_result.urls_attempted,
-                    "downloaded_count": len(link_result.downloaded_files),
-                    "failure_count": len(link_result.failures),
-                    "failures": [
-                        {
-                            "url": f.url,
-                            "error": f.error,
-                            "attempted_at": f.attempted_at,
-                            "error_type": f.error_type,
-                            "http_status": f.http_status,
-                        }
-                        for f in link_result.failures
-                    ],
-                }
-
-                self.cosmos_tools.log_classification_event(
-                    email_id=email_id,
-                    event_type="link_download_complete",
-                    details=email_data["_link_download_result"],
-                )
-            except Exception as e:
-                logger.error(f"Error during link download pre-processing: {e}", exc_info=True)
-                # Don't block email processing — continue without downloaded links
-
-            # ── Reconcile attachment info from Cosmos (authoritative source) ──
-            # The Logic App writes attachment paths to Cosmos before sending to
-            # the intake queue, so Cosmos may have richer data than the queue msg.
-            if cosmos_doc:
-                cosmos_att_paths = cosmos_doc.get("attachmentPaths") or []
-                email_att_paths = email_data.get("attachmentPaths") or []
-                if len(cosmos_att_paths) > len(email_att_paths):
-                    email_data["attachmentPaths"] = cosmos_att_paths
-                cosmos_att_count = cosmos_doc.get("attachmentsCount", 0)
-                email_att_count = email_data.get("attachmentsCount", 0)
-                if isinstance(email_att_count, str):
-                    try:
-                        email_att_count = int(email_att_count)
-                    except ValueError:
-                        email_att_count = 0
-                if isinstance(cosmos_att_count, str):
-                    try:
-                        cosmos_att_count = int(cosmos_att_count)
-                    except ValueError:
-                        cosmos_att_count = 0
-                if cosmos_att_count > email_att_count:
-                    email_data["attachmentsCount"] = cosmos_att_count
-                if cosmos_doc.get("hasAttachments") and not email_data.get("hasAttachments"):
+                            email_att_count = 0
+                    if isinstance(cosmos_att_count, str):
+                        try:
+                            cosmos_att_count = int(cosmos_att_count)
+                        except ValueError:
+                            cosmos_att_count = 0
+                    if cosmos_att_count > email_att_count:
+                        email_data["attachmentsCount"] = cosmos_att_count
+                    if cosmos_doc.get("hasAttachments") and not email_data.get("hasAttachments"):
+                        email_data["hasAttachments"] = True
+            else:
+                # SFTP source: file already in blob storage via Logic App
+                # Ensure attachmentPaths includes the blob path for processing
+                blob_path = email_data.get("blobPath")
+                if blob_path and not email_data.get("attachmentPaths"):
+                    email_data["attachmentPaths"] = [{"path": blob_path, "source": "sftp"}]
                     email_data["hasAttachments"] = True
+                    email_data["attachmentsCount"] = 1
 
             # =====================================================
             # STEP 2: PROCESS ATTACHMENTS (for PE-relevant emails)
@@ -400,6 +429,7 @@ class EmailClassificationAgent:
                     "hasAttachments": parse_bool(email_data.get("hasAttachments", False)),
                     "attachmentsCount": email_data.get("attachmentsCount", 0),
                     "attachmentPaths": email_data.get("attachmentPaths", []),
+                    "intakeSource": intake_source,
                     "relevance": relevance_block,
                     "pipelineMode": "triage-only",
                     "status": "triaged",
@@ -410,6 +440,11 @@ class EmailClassificationAgent:
                         "routedAt": datetime.utcnow().isoformat(),
                     },
                 }
+                # Add SFTP-specific fields to triage message
+                if intake_source == "sftp":
+                    triage_message["originalFilename"] = email_data.get("originalFilename", "")
+                    triage_message["fileType"] = email_data.get("fileType", "")
+                    triage_message["blobPath"] = email_data.get("blobPath", "")
 
                 triage_target = self.queue_tools.send_to_triage_queue(triage_message)
 
@@ -681,8 +716,11 @@ class EmailClassificationAgent:
         """
         Download and process PDF attachments using Document Intelligence.
         
+        For email sources: downloads via Graph API.
+        For SFTP sources: reads from Azure Blob Storage (already uploaded by Logic App).
+        
         Args:
-            email_data: Email content with attachment info
+            email_data: Email/SFTP content with attachment info
             
         Returns:
             List of processed attachment results
@@ -707,7 +745,12 @@ class EmailClassificationAgent:
         
         logger.info(f"Processing attachments (hasAttachments={has_attachments}, count={attachment_count})...")
         
-        # Get email identifiers for Graph API
+        intake_source = email_data.get("intakeSource", "email")
+        
+        if intake_source == "sftp":
+            return await self._process_sftp_attachments(email_data, attachment_paths)
+        
+        # ── Email source: download via Graph API ──
         graph_info = self.graph_tools.extract_email_info_from_message(email_data)
         user_id = graph_info.get("user_id")
         message_id = graph_info.get("message_id")
@@ -755,6 +798,53 @@ class EmailClassificationAgent:
             except Exception as e:
                 logger.error(f"Error processing attachment {attachment.get('name')}: {e}")
         
+        return results
+    
+    async def _process_sftp_attachments(self, email_data: dict, attachment_paths: list) -> list:
+        """
+        Process SFTP-sourced PDF attachments from Azure Blob Storage.
+        
+        The Logic App has already uploaded the file to blob storage.
+        This method downloads from blob and processes with Document Intelligence.
+        """
+        from azure.identity.aio import DefaultAzureCredential
+        from azure.storage.blob.aio import BlobServiceClient
+
+        storage_url = os.environ.get("STORAGE_ACCOUNT_URL")
+        if not storage_url:
+            logger.error("STORAGE_ACCOUNT_URL not set — cannot read SFTP blob")
+            return []
+
+        results = []
+        credential = DefaultAzureCredential()
+        blob_service = BlobServiceClient(account_url=storage_url, credential=credential)
+
+        try:
+            async with blob_service:
+                container_client = blob_service.get_container_client("attachments")
+                for entry in attachment_paths:
+                    blob_path = entry.get("path") if isinstance(entry, dict) else entry
+                    filename = blob_path.split("/")[-1] if "/" in blob_path else blob_path
+                    try:
+                        blob_client = container_client.get_blob_client(blob_path)
+                        download = await blob_client.download_blob()
+                        content_bytes = await download.readall()
+                        logger.info(f"Downloaded SFTP blob: {blob_path} ({len(content_bytes)} bytes)")
+
+                        extracted = await self.doc_intel_tool.analyze_document_from_bytes(
+                            document_bytes=content_bytes,
+                            filename=filename,
+                        )
+                        results.append({
+                            "name": filename,
+                            "size": len(content_bytes),
+                            "extracted_content": extracted,
+                        })
+                    except Exception as e:
+                        logger.error(f"Error processing SFTP blob {blob_path}: {e}", exc_info=True)
+        finally:
+            await credential.close()
+
         return results
     
     async def _classify_email(self, email_data: dict, attachment_analysis: list) -> dict:
@@ -818,13 +908,28 @@ class EmailClassificationAgent:
                 attachment_summary = "No PDF attachments found or processed."
         
         # Prepare the user prompt
-        user_prompt = FULL_CLASSIFICATION_USER_PROMPT.format(
-            sender=email_data.get("from", "Unknown"),
-            subject=email_data.get("subject", "No subject"),
-            received_date=email_data.get("receivedAt", "Unknown"),
-            body_text=email_data.get("bodyText", "")[:3000],
-            attachment_analysis=attachment_summary
-        )
+        intake_source = email_data.get("intakeSource", "email")
+        if intake_source == "sftp":
+            user_prompt = SFTP_CLASSIFICATION_USER_PROMPT.format(
+                original_filename=email_data.get("originalFilename", "unknown"),
+                file_type=email_data.get("fileType", "unknown"),
+                received_date=email_data.get("receivedAt", "Unknown"),
+                account=email_data.get("account", "Unknown"),
+                fund=email_data.get("fund", "Unknown"),
+                doc_type=email_data.get("docType", "Unknown"),
+                name=email_data.get("name", "Unknown"),
+                published_date=email_data.get("publishedDate", "Unknown"),
+                effective_date=email_data.get("effectiveDate", "Unknown"),
+                attachment_analysis=attachment_summary,
+            )
+        else:
+            user_prompt = FULL_CLASSIFICATION_USER_PROMPT.format(
+                sender=email_data.get("from", "Unknown"),
+                subject=email_data.get("subject", "No subject"),
+                received_date=email_data.get("receivedAt", "Unknown"),
+                body_text=email_data.get("bodyText", "")[:3000],
+                attachment_analysis=attachment_summary
+            )
         
         # Create agent if not exists
         if not self._classification_agent:
