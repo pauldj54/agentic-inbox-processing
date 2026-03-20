@@ -20,6 +20,9 @@ aiohttp>=3.9.0
 # Azure Blob Storage SDK (blob upload for link-sourced attachments — see plan.md Dependency gate)
 azure-storage-blob>=12.19.0
 
+# Azure Key Vault SDK (retrieve secrets like Graph API client secret)
+azure-keyvault-secrets>=4.7.0
+
 # Azure Document Intelligence (PDF attachment extraction)
 azure-ai-documentintelligence>=1.0.0
 

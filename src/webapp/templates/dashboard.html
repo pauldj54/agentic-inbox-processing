@@ -26,6 +26,7 @@
         .status-failed { background-color: #FDE7E9; color: #D13438; }
         .status-pending { background-color: #F3F2F1; color: #605E5C; }
         .status-classified { background-color: #DFF6DD; color: #107C10; }
+        .status-triaged { background-color: #E5F1FB; color: #0078D4; }
         .status-processed { background-color: #E5F1FB; color: #0078D4; }
         .status-discarded { background-color: #F3F2F1; color: #605E5C; }
         .status-needs_review { background-color: #FFF4CE; color: #8A6914; }
@@ -129,7 +130,7 @@
                                 <tr class="hover:bg-gray-50 {% if email.isDuplicate %}bg-orange-50{% endif %}">
                                     <td class="px-4 py-3 whitespace-nowrap">
                                         <div class="flex flex-col gap-1">
-                                            {% set display_status = 'processed' if email.pipelineMode == 'triage-only' else email.status|default('pending') %}
+                                            {% set display_status = email.status|default('pending') %}
                                             <span class="px-2 py-1 text-xs font-medium rounded-full status-{{ display_status }}">
                                                 {{ display_status|upper }}
                                             </span>
@@ -254,19 +255,33 @@
                                 
                                 {# Handle both intake queue (flat structure) and routed queues (nested original_email) #}
                                 {% set email = msg.body.original_email if msg.body.original_email else msg.body %}
+                                {% set is_sftp = (email.intakeSource == 'sftp' or msg.body.intakeSource == 'sftp') %}
                                 
-                                {# Sender #}
+                                {# SFTP source badge + filename #}
+                                {% if is_sftp %}
+                                <div class="flex items-center gap-1 mb-1">
+                                    <span class="px-1.5 py-0.5 text-xs font-medium rounded bg-green-100 text-green-700">📁 SFTP</span>
+                                    {% if email.fileType or msg.body.fileType %}
+                                    <span class="px-1.5 py-0.5 text-xs font-medium rounded bg-gray-100 text-gray-700 uppercase">{{ email.fileType or msg.body.fileType }}</span>
+                                    {% endif %}
+                                </div>
+                                <p class="text-sm font-medium text-gray-900 truncate" title="{{ email.originalFilename or msg.body.originalFilename or '—' }}">
+                                    📄 {{ (email.originalFilename or msg.body.originalFilename or '—')|truncate_text(40) }}
+                                </p>
+                                {% else %}
+                                {# Sender (email) #}
                                 {% if email.from or msg.body.from %}
                                 <p class="text-sm font-medium text-gray-900 truncate" title="{{ email.from or msg.body.from }}">
                                     👤 {{ (email.from or msg.body.from)|truncate_text(35) }}
                                 </p>
                                 {% endif %}
                                 
-                                {# Subject #}
+                                {# Subject (email) #}
                                 {% if email.subject or msg.body.subject %}
                                 <p class="text-sm text-gray-700 truncate" title="{{ email.subject or msg.body.subject }}">
                                     📌 {{ (email.subject or msg.body.subject)|truncate_text(40) }}
                                 </p>
+                                {% endif %}
                                 {% endif %}
                                 
                                 {# Classification info (for routed queues) #}

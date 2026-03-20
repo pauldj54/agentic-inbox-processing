@@ -158,8 +158,9 @@ class EmailClassificationAgent:
         intake_source = email_data.get("intakeSource", "email")
 
         if intake_source == "sftp":
-            # SFTP-sourced PDF: use fileId as document ID
-            email_id = email_data.get("fileId") or email_data.get("id") or "unknown"
+            # SFTP-sourced PDF: use dedupKey (= Cosmos document id) for lookup
+            # Falls back to fileId for backward compatibility with older messages
+            email_id = email_data.get("dedupKey") or email_data.get("fileId") or email_data.get("id") or "unknown"
             logger.info(f"Processing SFTP file: {email_id[:30]}...")
         else:
             # Email-sourced: use emailId or id

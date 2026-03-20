@@ -1,6 +1,6 @@
 """
 Service Bus Queue Tools for email processing.
-Handles reading from email-intake queue and routing to other queues.
+Handles reading from intake queue and routing to other queues.
 Uses DefaultAzureCredential for passwordless authentication.
 """
 
@@ -32,7 +32,7 @@ class QueueTools:
     """Tools for interacting with Azure Service Bus queues."""
     
     # Queue names for the email processing pipeline (simplified)
-    QUEUE_EMAIL_INTAKE = "email-intake"       # Incoming emails
+    QUEUE_EMAIL_INTAKE = os.environ.get("INTAKE_QUEUE", "intake")       # Incoming emails + SFTP PDFs
     QUEUE_DISCARDED = os.environ.get("DISCARDED_QUEUE", "discarded")             # Non-PE emails
     QUEUE_HUMAN_REVIEW = os.environ.get("HUMAN_REVIEW_QUEUE", "human-review")       # Low confidence (<65%) needs disambiguation
     QUEUE_ARCHIVAL_PENDING = os.environ.get("ARCHIVAL_PENDING_QUEUE", "archival-pending")  # Ready for archival (>=65% confidence)
@@ -430,7 +430,7 @@ def get_queue_tool_definitions() -> list:
             "function": {
                 "name": "receive_email_from_intake",
                 "description": (
-                    "Receives the next email message from the email-intake queue. "
+                    "Receives the next email message from the intake queue. "
                     "The message is removed from the queue after successful processing. "
                     "Returns the email data including sender, subject, body text, and "
                     "any attachment information."

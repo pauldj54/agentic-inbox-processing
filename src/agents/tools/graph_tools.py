@@ -15,6 +15,7 @@ import logging
 import base64
 from typing import Optional, List
 from azure.identity import DefaultAzureCredential, ClientSecretCredential
+from azure.keyvault.secrets import SecretClient
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,17 @@ class GraphAPITools:
         self.client_id = os.environ.get("GRAPH_CLIENT_ID")
         self.client_secret = os.environ.get("GRAPH_CLIENT_SECRET")
         self.tenant_id = os.environ.get("GRAPH_TENANT_ID")
+        
+        # Fall back to Key Vault if client secret not in env
+        if self.client_id and not self.client_secret and self.tenant_id:
+            kv_url = os.environ.get("KEY_VAULT_URL")
+            if kv_url:
+                try:
+                    kv_client = SecretClient(vault_url=kv_url, credential=DefaultAzureCredential())
+                    self.client_secret = kv_client.get_secret("graph-client-secret").value
+                    logger.info("Retrieved GRAPH_CLIENT_SECRET from Key Vault")
+                except Exception as e:
+                    logger.warning(f"Failed to retrieve graph-client-secret from Key Vault: {e}")
         
         if self.client_id and self.client_secret and self.tenant_id:
             logger.info("Using ClientSecretCredential for Graph API (App Registration)")

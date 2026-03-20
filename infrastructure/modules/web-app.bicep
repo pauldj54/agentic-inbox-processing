@@ -92,14 +92,10 @@ resource webApp 'Microsoft.Web/sites@2023-12-01' = {
           name: 'WEBSITE_RUN_FROM_PACKAGE'
           value: '0'
         }
-        {
-          name: 'AZURE_TENANT_ID'
-          value: authTenantId
-        }
-        {
-          name: 'AZURE_CLIENT_ID'
-          value: authClientId
-        }
+        // NOTE: DO NOT set AZURE_CLIENT_ID or AZURE_TENANT_ID as app settings.
+        // DefaultAzureCredential interprets these as User Assigned MI config,
+        // which breaks System Assigned MI authentication. Easy Auth uses
+        // authsettingsV2 below and does not need these as env vars.
       ]
     }
   }

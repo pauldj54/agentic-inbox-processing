@@ -3,7 +3,7 @@ Integration test for SFTP file intake flow (T021, T025, T027, T032).
 
 Tests cover:
   - CSV/Excel file → blob backup + Cosmos record with parsed metadata + sharepointPath + status "archived"
-  - PDF file → blob backup + Cosmos record + Service Bus message to email-intake queue
+  - PDF file → blob backup + Cosmos record + Service Bus message to intake queue
   - Filename parse failure → Cosmos record with status "error" and metadataParseError
   - SFTP PDF in full mode → agent classifies → routed to archival-pending/human-review/discarded
   - SFTP PDF in triage-only mode → routed to triage-complete queue
@@ -147,7 +147,7 @@ class TestSftpFilenameParseFailure:
 
 
 class TestSftpPdfRouting:
-    """US2: PDF files from SFTP are sent to email-intake queue."""
+    """US2: PDF files from SFTP are sent to intake queue."""
 
     def test_pdf_service_bus_message_matches_contract(self):
         """PDF → Service Bus message contains all required fields per contract §1."""
@@ -185,18 +185,18 @@ class TestSftpPdfRouting:
         assert "subject" not in message
 
     def test_pdf_cosmos_record_has_queue_field(self):
-        """PDF Cosmos record has queue set to 'email-intake'."""
+        """PDF Cosmos record has queue set to 'intake'."""
         record = {
             "id": "sftp-pdf-test-001",
             "intakeSource": "sftp",
             "status": "received",
             "fileType": "pdf",
-            "queue": "email-intake",
+            "queue": "intake",
             "stepsExecuted": ["metadata-parse", "blob-upload", "queue-send"],
             "sharepointPath": None,
         }
 
-        assert record["queue"] == "email-intake"
+        assert record["queue"] == "intake"
         assert "queue-send" in record["stepsExecuted"]
         assert record["sharepointPath"] is None
 
