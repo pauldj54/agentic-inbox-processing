@@ -1486,14 +1486,6 @@
                     {
                       "name": "WEBSITE_RUN_FROM_PACKAGE",
                       "value": "0"
-                    },
-                    {
-                      "name": "AZURE_TENANT_ID",
-                      "value": "[parameters('authTenantId')]"
-                    },
-                    {
-                      "name": "AZURE_CLIENT_ID",
-                      "value": "[parameters('authClientId')]"
                     }
                   ]
                 }

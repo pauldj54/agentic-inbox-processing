@@ -20,7 +20,7 @@ def send_test_message():
     print(f"Sending test message to {namespace}...")
     
     with ServiceBusClient(f"{namespace}.servicebus.windows.net", credential) as client:
-        with client.get_queue_sender('email-intake') as sender:
+        with client.get_queue_sender('intake') as sender:
             test_email = {
                 'id': 'test-capital-call-007',
                 'from': 'admin@horizonfund.com',
@@ -47,7 +47,7 @@ Fund Administrator''',
                 'bodyPreview': 'Capital Call Notice Q1 2026'
             }
             sender.send_messages(ServiceBusMessage(json.dumps(test_email)))
-            print("✅ Test email sent to email-intake queue!")
+            print("✅ Test email sent to intake queue!")
 
 async def process_message():
     """Process the message with the agent."""

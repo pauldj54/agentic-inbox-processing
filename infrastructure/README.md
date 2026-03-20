@@ -14,7 +14,7 @@ This folder contains Azure Bicep templates for deploying the email processing au
 │  ┌──────────────┐     ┌──────────────┐     ┌──────────────────────────────────┐│
 │  │   M365       │     │  Logic App   │     │         Service Bus              ││
 │  │   Inbox      │────▶│  (Trigger)   │────▶│  ┌─────────────────────────────┐ ││
-│  │              │     │              │     │  │ email-intake                │ ││
+│  │              │     │              │     │  │ intake                      │ ││
 │  └──────────────┘     └──────────────┘     │  │ classification-pending      │ ││
 │                              │             │  │ human-review                │ ││
 │                              │             │  │ archival-pending            │ ││
@@ -64,7 +64,7 @@ This folder contains Azure Bicep templates for deploying the email processing au
 
 ```
                     ┌─────────────────┐
-                    │  email-intake   │
+                    │  intake         │
                     └────────┬────────┘
                              │
                              ▼

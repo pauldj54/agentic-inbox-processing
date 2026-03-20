@@ -3,7 +3,7 @@
 Email Classification Agent Runner
 ==================================
 Script to run the email classification agent locally.
-Processes emails from the email-intake queue and routes them based on classification.
+Processes emails from the intake queue and routes them based on classification.
 
 Usage:
     python run_agent.py [--once] [--max-emails N]

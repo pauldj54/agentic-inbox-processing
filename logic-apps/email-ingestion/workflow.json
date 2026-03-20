@@ -202,7 +202,7 @@
                     "body": {
                         "ContentData": "@base64(concat('{','\n','  \"emailId\": \"',triggerOutputs()?['body/id'],'\",','\n','  \"from\": \"',triggerOutputs()?['body/from'],'\",','\n','  \"subject\": \"',triggerOutputs()?['body/subject'],'\",','\n','  \"bodyText\": \"',triggerOutputs()?['body/bodyPreview'],'\", ','\n','  \"receivedAt\": \"',triggerOutputs()?['body/receivedDateTime'],'\",','\n','  \"attachmentsCount\":',variables('AttachmentsCount'),' ,','\n','  \"hasAttachments\": ',greater(variables('AttachmentsCount'),0),',','\n','  \"attachmentPaths\": ',variables('AttachmentPaths'),',','\n','  \"priority\": \"normal\",','\n','  \"source\": \"logic-app-ingestion\"','\n','}'))"
                     },
-                    "path": "/@{encodeURIComponent(encodeURIComponent('email-intake'))}/messages",
+                    "path": "/@{encodeURIComponent(encodeURIComponent('intake'))}/messages",
                     "queries": {
                         "systemProperties": "None"
                     }

@@ -23,7 +23,7 @@ sb_client = ServiceBusClient(
     credential=credential
 )
 
-queues = ['email-intake', 'discarded', 'human-review', 'archival-pending']
+queues = ['intake', 'discarded', 'human-review', 'archival-pending']
 with sb_client:
     for q in queues:
         try:

@@ -73,7 +73,7 @@ def test_service_bus(credential):
         
         # Try to get a receiver (validates connection)
         with client:
-            receiver = client.get_queue_receiver("email-intake", max_wait_time=1)
+            receiver = client.get_queue_receiver("intake", max_wait_time=1)
             with receiver:
                 pass  # Just open and close to test connection
         

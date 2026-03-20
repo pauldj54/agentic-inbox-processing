@@ -29,6 +29,9 @@
         "filenameDelimiter": {
             "value": "_"
         },
+        "sftpFailedPath": {
+            "value": "/failed/"
+        },
         "$connections": {
             "value": {
                 "sftpwithssh": {

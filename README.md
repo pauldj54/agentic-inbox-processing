@@ -17,6 +17,7 @@ An intelligent document classification system for Private Equity (PE) lifecycle 
 - [Pipeline Configuration](#pipeline-configuration)
 - [Authentication (Entra ID Easy Auth)](#authentication-entra-id-easy-auth)
 - [Deploying to Azure](#deploying-to-azure)
+- [Connections and Secrets Management](#connections-and-secrets-management)
 - [Troubleshooting](#troubleshooting)
 
 ## Overview
@@ -63,7 +64,7 @@ This solution provides:
        ▼            │                      │      CSV/XLS     PDF
 ┌──────────────┐    │                      │          │        │
 │ Service Bus  │◀───┘                      └──────────│────────┘
-│ email-intake │                                      │
+│ intake       │                                      │
 └──────┬───────┘                                      ▼
        │                                   ┌──────────────────┐
        ▼                                   │ SharePoint       │
@@ -126,7 +127,7 @@ Create the following Azure services (or use the provided Bicep templates in `/in
 ### 2. Azure Service Bus
 - Create a Service Bus namespace (Standard tier or higher)
 - Create the following queues:
-  - `email-intake` - Incoming emails
+  - `intake` - Incoming emails (from email Logic App + SFTP Logic App)
   - `discarded` - Non-PE emails
   - `human-review` - Low confidence classifications
   - `archival-pending` - Successfully classified emails
@@ -230,9 +231,11 @@ DOCUMENT_INTELLIGENCE_ENDPOINT=https://<your-doc-intel>.cognitiveservices.azure.
 # Azure Storage Account (for blob backup of ingested documents)
 STORAGE_ACCOUNT_NAME=<your-storage-account-name>
 
-# Microsoft Graph API (optional - for direct mailbox access)
+# Azure Key Vault (stores Graph and SharePoint client secrets)
+KEY_VAULT_URL=https://<your-key-vault>.vault.azure.net/
+
+# Microsoft Graph API (client secret is fetched from Key Vault at runtime)
 # GRAPH_CLIENT_ID=<app-registration-client-id>
-# GRAPH_CLIENT_SECRET=<app-registration-client-secret>
 # GRAPH_TENANT_ID=<your-tenant-id>
 
 # Pipeline Configuration
@@ -337,7 +340,7 @@ namespace = os.environ['SERVICEBUS_NAMESPACE']
 
 cred = DefaultAzureCredential()
 client = ServiceBusClient(f'{namespace}.servicebus.windows.net', credential=cred)
-sender = client.get_queue_sender('email-intake')
+sender = client.get_queue_sender('intake')
 
 email = {
     'id': 'test-001',
@@ -350,7 +353,7 @@ email = {
 }
 
 sender.send_messages(ServiceBusMessage(json.dumps(email)))
-print('Test email sent to email-intake queue!')
+print('Test email sent to intake queue!')
 sender.close()
 client.close()
 ```
@@ -452,7 +455,7 @@ The system classifies emails into these Private Equity lifecycle events:
 
 | Queue | Env Variable | Default | Routing Condition |
 |-------|-------------|---------|-------------------|
-| email-intake | — | `email-intake` | Entry point (emails + SFTP PDFs) |
+| intake | `INTAKE_QUEUE` | `intake` | Entry point (emails + SFTP PDFs) |
 | discarded | `DISCARDED_QUEUE` | `discarded` | Not PE Related classification |
 | archival-pending | `ARCHIVAL_PENDING_QUEUE` | `archival-pending` | Confidence ≥ 65% |
 | human-review | `HUMAN_REVIEW_QUEUE` | `human-review` | Confidence < 65% |
@@ -529,7 +532,7 @@ Each SFTP intake record in Cosmos DB includes:
 | File Type | Destination | Method |
 |-----------|------------|--------|
 | CSV, XLS, XLSX | SharePoint document library | Graph API PUT (organized by `/{Letter}/{Account}/{Fund}/`) |
-| PDF | Service Bus `email-intake` queue | Classification agent processes it |
+| PDF | Service Bus `intake` queue | Classification agent processes it |
 | Other | Logged and skipped | File remains in blob storage |
 
 ### SFTP Filename Convention
@@ -708,13 +711,15 @@ Once Easy Auth is enabled, these endpoints are available automatically:
 
 ## Deploying to Azure
 
-This section provides step-by-step instructions for deploying the application to Azure App Service.
+This section provides step-by-step instructions for deploying the application to Azure.
 
 ### Prerequisites
 
 - **Azure CLI** installed and authenticated (`az login`)
+- **Azure CLI Logic App extension**: `az extension add --name logic`
 - An **Azure subscription** with permissions to create resources
-- An **Entra ID App Registration** (see [Authentication](#authentication-entra-id-easy-auth) section)
+- An **Entra ID App Registration** for the web dashboard (see [Authentication](#authentication-entra-id-easy-auth) section)
+- An **Entra ID App Registration** for the Graph API / SharePoint service principal
 
 ### Step 1: Provision Infrastructure
 
@@ -735,9 +740,85 @@ az deployment group create \
   --parameters infrastructure/parameters/dev.bicepparam
 ```
 
-This creates: App Service Plan, Web App, Cosmos DB, Service Bus, Storage Account, Document Intelligence, Log Analytics, Logic App, and all RBAC role assignments.
+This creates: App Service Plan, Web App, Cosmos DB, Service Bus, Storage Account, Document Intelligence, Log Analytics, Key Vault, Logic Apps (email + SFTP), and all RBAC role assignments.
 
-### Step 2: Add Required App Settings
+### Step 2: Pre-Provision Key Vault Secrets
+
+The Key Vault is created by Bicep but **secrets must be manually provisioned** before deploying the Logic Apps and webapp. These secrets contain credentials for external service principals that cannot use managed identity.
+
+| Secret Name | Purpose | Where Used |
+|-------------|---------|------------|
+| `sharepoint-client-secret` | Entra ID client secret for SharePoint Graph API uploads | SFTP Logic App (`Upload_to_SharePoint` action) |
+| `graph-client-secret` | Entra ID client secret for Microsoft Graph API (email attachments) | Web App (`graph_tools.py`) |
+| `sftp-private-key` | SSH private key for SFTP connector authentication | SFTP-SSH API Connection (Bicep `getSecret()`) |
+
+**Create the secrets:**
+
+```powershell
+$keyVaultName = "<your-key-vault-name>"   # e.g., kv-docproc-dev-izr2ch55
+
+# SharePoint client secret (from Entra ID app registration)
+az keyvault secret set `
+  --vault-name $keyVaultName `
+  --name "sharepoint-client-secret" `
+  --value "<your-sharepoint-client-secret>"
+
+# Graph API client secret (from Entra ID app registration)
+az keyvault secret set `
+  --vault-name $keyVaultName `
+  --name "graph-client-secret" `
+  --value "<your-graph-api-client-secret>"
+
+# SFTP private key (from file)
+az keyvault secret set `
+  --vault-name $keyVaultName `
+  --name "sftp-private-key" `
+  --file "<path-to-your-sftp-private-key.pem>"
+```
+
+```bash
+# Bash equivalent
+KEY_VAULT_NAME="<your-key-vault-name>"
+
+az keyvault secret set \
+  --vault-name "$KEY_VAULT_NAME" \
+  --name "sharepoint-client-secret" \
+  --value "<your-sharepoint-client-secret>"
+
+az keyvault secret set \
+  --vault-name "$KEY_VAULT_NAME" \
+  --name "graph-client-secret" \
+  --value "<your-graph-api-client-secret>"
+
+az keyvault secret set \
+  --vault-name "$KEY_VAULT_NAME" \
+  --name "sftp-private-key" \
+  --file "<path-to-your-sftp-private-key.pem>"
+```
+
+> **Note**: The `sftp-private-key` uses `--file` (not `--value`) because PEM keys are multi-line. The other two secrets are single-line client secret values from Entra ID App Registrations.
+
+### Step 3: Deploy with the Deployment Script
+
+The provided [`deploy_updates.ps1`](deploy_updates.ps1) script deploys all components in the correct order:
+
+```powershell
+.\deploy_updates.ps1
+```
+
+**What the script does:**
+
+| Step | Component | Action |
+|------|-----------|--------|
+| **1a** | Email Logic App | Deploys the workflow definition from `logic-apps/email-ingestion/workflow.json` |
+| **1b** | SFTP Logic App | Fetches `sharepoint-client-secret` from Key Vault, reads current Logic App parameters (preserving `$connections`), injects the secret, and deploys the workflow definition with parameters |
+| **2** | Web App | Zips `src/`, `utils/`, `requirements.txt`, `startup.sh` and deploys via `az webapp deploy` |
+| **3** | App Settings | Ensures `STORAGE_ACCOUNT_URL`, `KEY_VAULT_URL`, `GRAPH_CLIENT_ID`, `GRAPH_TENANT_ID` are set on the Web App |
+| **4** | RBAC | Assigns `Key Vault Secrets User` role to the Web App managed identity on the Key Vault |
+
+> **Customizing for your environment**: Edit the variables at the top of the script (`$resourceGroup`, `$logicAppName`, `$sftpLogicAppName`, `$webAppName`, `$keyVaultName`) and the `GRAPH_CLIENT_ID` / `GRAPH_TENANT_ID` values in the app settings section.
+
+### Step 4: Add Remaining App Settings
 
 After infrastructure provisioning, add the app settings that map to the variable names the application code expects:
 
@@ -756,7 +837,7 @@ az webapp config appsettings set \
 
 > **Note**: The Bicep templates create `COSMOS_DB_ENDPOINT` and `SERVICE_BUS_NAMESPACE`, but the application code expects `COSMOS_ENDPOINT` and `SERVICEBUS_NAMESPACE`. Add both naming variants to avoid `KeyError` crashes.
 
-### Step 3: Set the Startup Command
+### Step 5: Set the Startup Command
 
 The startup command **must be set via the ARM REST API** because `az webapp config set --startup-file` silently fails for Python Linux apps:
 
@@ -772,37 +853,7 @@ az rest --method PATCH \
 
 > **Why ARM REST API?** Azure CLI's `--startup-file` flag for Python apps has a known issue where it appears to succeed but doesn't persist the value. Using the ARM REST API with `appCommandLine` is reliable.
 
-### Step 4: Deploy Application Code
-
-Package and deploy the application code as a zip:
-
-```powershell
-# PowerShell
-Compress-Archive -Path src, utils, requirements.txt, startup.sh, pyproject.toml -DestinationPath deploy.zip -Force
-
-az webapp deploy `
-  --resource-group rg-docproc-dev `
-  --name <your-app-name> `
-  --src-path deploy.zip `
-  --type zip `
-  --async true
-```
-
-```bash
-# Bash
-zip -r deploy.zip src/ utils/ requirements.txt startup.sh pyproject.toml
-
-az webapp deploy \
-  --resource-group rg-docproc-dev \
-  --name <your-app-name> \
-  --src-path deploy.zip \
-  --type zip \
-  --async true
-```
-
-> **Important**: The App Service uses Oryx build system with `SCM_DO_BUILD_DURING_DEPLOYMENT=true`. This means `pip install -r requirements.txt` runs automatically during deployment. The built app is served from `/tmp/<hash>/`, not `/home/site/wwwroot/` — do NOT use `--chdir` in the startup command.
-
-### Step 5: Verify Deployment
+### Step 6: Verify Deployment
 
 ```bash
 # Check the app is running
@@ -818,28 +869,157 @@ curl -s -o /dev/null -w "HTTP_STATUS=%{http_code}" "https://<your-app-name>.azur
 
 A `302` (redirect to login) or `401` response confirms the app is running and Easy Auth is active. Open the URL in a browser to sign in with your Entra ID credentials and access the dashboard.
 
-### Step 6: Subsequent Deployments
+### Step 7: Subsequent Deployments
 
-For code-only updates (no infrastructure changes), repeat Steps 4 and 5:
+For code-only updates (no infrastructure changes), run the deploy script:
+
+```powershell
+.\deploy_updates.ps1
+```
+
+Or manually deploy just the webapp:
 
 ```powershell
 # Quick redeploy (PowerShell)
-Compress-Archive -Path src, utils, requirements.txt, startup.sh, pyproject.toml -DestinationPath deploy.zip -Force
+Compress-Archive -Path src, utils, requirements.txt, startup.sh -DestinationPath deploy.zip -Force
 az webapp deploy --resource-group rg-docproc-dev --name <your-app-name> --src-path deploy.zip --type zip --async true
 Remove-Item deploy.zip
 ```
+
+> **Important**: The App Service uses Oryx build system with `SCM_DO_BUILD_DURING_DEPLOYMENT=true`. This means `pip install -r requirements.txt` runs automatically during deployment. The built app is served from `/tmp/<hash>/`, not `/home/site/wwwroot/` — do NOT use `--chdir` in the startup command.
 
 ### Deployment Checklist
 
 | Step | Action | Verification |
 |------|--------|-------------|
 | 1 | Provision infrastructure with Bicep | `az deployment group show` returns `Succeeded` |
-| 2 | Create Entra ID App Registration | App appears in Azure Portal → Entra ID → App registrations |
-| 3 | Add app settings (`COSMOS_ENDPOINT`, `SERVICEBUS_NAMESPACE`, etc.) | `az webapp config appsettings list` shows all settings |
-| 4 | Set startup command via ARM REST API | `az webapp show --query siteConfig.appCommandLine` returns the gunicorn command |
-| 5 | Deploy code as zip | `az webapp deploy` completes without errors |
-| 6 | Verify app is running | Browser shows Entra ID login → dashboard after sign-in |
-| 7 | Set `PIPELINE_MODE` | `az webapp config appsettings list` shows `PIPELINE_MODE=full` or `triage-only` |
+| 2 | Pre-provision Key Vault secrets | `az keyvault secret list --vault-name <kv>` shows 3 secrets |
+| 3 | Create Entra ID App Registrations | Apps appear in Azure Portal → Entra ID → App registrations |
+| 4 | Run `.\deploy_updates.ps1` | All steps report success (green output) |
+| 5 | Add remaining app settings | `az webapp config appsettings list` shows all settings |
+| 6 | Set startup command via ARM REST API | `az webapp show --query siteConfig.appCommandLine` returns the gunicorn command |
+| 7 | Verify app is running | Browser shows Entra ID login → dashboard after sign-in |
+| 8 | Verify SFTP Logic App | Upload a test file to SFTP `/in/` → check Logic App run history |
+
+---
+
+## Connections and Secrets Management
+
+This section explains how secrets, API connections, and authentication are managed across the solution.
+
+### Key Vault Architecture
+
+Azure Key Vault is the centralized secret store for all sensitive credentials. Secrets are **pre-provisioned manually** (not created by Bicep) and consumed at deploy time or runtime.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Azure Key Vault                       │
+│                                                         │
+│  ┌─────────────────────────┐                            │
+│  │ sharepoint-client-secret │──▶ SFTP Logic App         │
+│  │                         │   (injected at deploy time │
+│  │                         │    via deploy_updates.ps1) │
+│  └─────────────────────────┘                            │
+│                                                         │
+│  ┌─────────────────────────┐                            │
+│  │ graph-client-secret     │──▶ Web App                 │
+│  │                         │   (fetched at runtime via  │
+│  │                         │    SecretClient SDK)        │
+│  └─────────────────────────┘                            │
+│                                                         │
+│  ┌─────────────────────────┐                            │
+│  │ sftp-private-key        │──▶ SFTP-SSH API Connection │
+│  │                         │   (injected at Bicep       │
+│  │                         │    deploy via getSecret())  │
+│  └─────────────────────────┘                            │
+└─────────────────────────────────────────────────────────┘
+```
+
+### How Secrets Are Consumed
+
+| Secret | Consumer | Injection Method | When |
+|--------|----------|-----------------|------|
+| `sharepoint-client-secret` | SFTP Logic App (`Upload_to_SharePoint`) | `deploy_updates.ps1` fetches from KV and injects via `--parameters` | Deploy time |
+| `graph-client-secret` | Web App (`graph_tools.py`) | `SecretClient` SDK with managed identity | Runtime |
+| `sftp-private-key` | SFTP-SSH API Connection resource | Bicep `getSecret()` function | Infrastructure deploy |
+
+### RBAC Requirements for Key Vault
+
+The Key Vault uses **RBAC authorization** (not access policies). The following identities need roles:
+
+| Identity | Role | Purpose |
+|----------|------|---------|
+| Web App managed identity | `Key Vault Secrets User` | Read `graph-client-secret` at runtime |
+| Deployer (your Azure CLI identity) | `Key Vault Secrets User` | Read secrets during `deploy_updates.ps1` execution |
+| Deployer (your Azure CLI identity) | `Key Vault Secrets Officer` | Create/update secrets (one-time provisioning) |
+
+> The `deploy_updates.ps1` script automatically assigns `Key Vault Secrets User` to the Web App managed identity. Deployer roles must be assigned manually or via Bicep.
+
+### API Connections (Logic App Managed Connectors)
+
+Logic Apps use **managed connectors** that are provisioned as `Microsoft.Web/connections` resources. Each connection authenticates differently:
+
+| Connection | Auth Type | How Credentials Are Managed |
+|------------|-----------|---------------------------|
+| `sftpwithssh` (trigger) | SSH private key | Key from Key Vault via Bicep `getSecret()` at infra deploy |
+| `sftpwithssh-1` (actions) | SSH private key | Same key, same injection method |
+| `documentdb` (Cosmos DB) | Managed identity | No secrets — uses Logic App system-assigned MI |
+| `azureblob` (Storage) | Managed identity | No secrets — uses Logic App system-assigned MI |
+| `servicebus` (Service Bus) | Managed identity | No secrets — uses Logic App system-assigned MI |
+
+### Graph API Authentication
+
+The solution uses Microsoft Graph API in two contexts with different auth patterns:
+
+**1. SFTP Logic App → SharePoint (File Uploads)**
+- Uses an HTTP action with `ActiveDirectoryOAuth` client credentials
+- The `sharepointClientSecret` is a Logic App workflow parameter injected at deploy time from Key Vault
+- This is necessary because the Logic App Consumption tier does not support managed identity for service principal-based Graph API calls
+
+**2. Web App → Graph API (Email Attachments)**
+- The `GraphAPITools` class in [`src/agents/tools/graph_tools.py`](src/agents/tools/graph_tools.py) uses `ClientSecretCredential`
+- The client secret is fetched from Key Vault at runtime using the Web App's managed identity
+- Falls back to `DefaultAzureCredential` if no client credentials are available (but this only works for the app's own identity, not for accessing other users' mailboxes)
+- Required env vars on the Web App: `GRAPH_CLIENT_ID`, `GRAPH_TENANT_ID`, `KEY_VAULT_URL`
+
+### Entra ID App Registrations
+
+Two separate app registrations are used:
+
+| App Registration | Purpose | API Permissions | Secret Location |
+|-----------------|---------|-----------------|-----------------|
+| Graph API / SharePoint SP | Email attachment download + SharePoint file upload | `Mail.Read` (Application), `Sites.ReadWrite.All` or `Sites.Selected` (Application) | Key Vault: `graph-client-secret` and `sharepoint-client-secret` |
+| Dashboard (Easy Auth) | Web dashboard authentication | N/A (used for sign-in only) | No secret needed (platform-managed) |
+
+> If the Graph API and SharePoint app registrations use the **same** Entra ID app, then `graph-client-secret` and `sharepoint-client-secret` will have the same value. You can still store them as separate secrets for clarity and independent rotation.
+
+### Setting Up Connections for a New Tenant
+
+When deploying to a new tenant, follow this sequence:
+
+**1. Create Entra ID App Registrations:**
+```bash
+# Graph API / SharePoint service principal
+az ad app create --display-name "docproc-graph-sp" \
+  --required-resource-accesses '[
+    {"resourceAppId": "00000003-0000-0000-c000-000000000000", "resourceAccess": [
+      {"id": "810c84a8-4a9e-49e6-bf7d-12d183f40d01", "type": "Role"},
+      {"id": "9492366f-7969-46a4-8d15-ed1a20078fff", "type": "Role"}
+    ]}
+  ]'
+
+# Grant admin consent (requires Global Admin or Privileged Role Administrator)
+az ad app permission admin-consent --id <app-id>
+
+# Create a client secret (valid for 2 years)
+az ad app credential reset --id <app-id> --years 2
+```
+
+**2. Provision Key Vault secrets** (see Step 2 above)
+
+**3. Deploy infrastructure** with your tenant-specific values in `parameters/dev.bicepparam`
+
+**4. Run the deployment script** `.\deploy_updates.ps1`
 
 ---
 

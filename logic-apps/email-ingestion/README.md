@@ -17,7 +17,7 @@ This Logic App workflow processes incoming emails from Microsoft 365 and routes 
 │                    ↓                                                         │
 │  4. Create/Update email document in Cosmos DB (with correct counts)         │
 │                    ↓                                                         │
-│  5. Send message to Service Bus (email-intake queue)                        │
+│  5. Send message to Service Bus (intake queue)                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -89,5 +89,5 @@ az deployment group create \
 - Verify Cosmos DB connection has write permissions
 
 ### Service Bus messages not being processed
-- Check the `email-intake` queue for messages
+- Check the `intake` queue for messages
 - Verify the AI agent is running (`python src/agents/run_agent.py`)

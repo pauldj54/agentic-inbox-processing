@@ -19,6 +19,10 @@
         "defaultValue": "/processed/",
         "type": "String"
       },
+      "sftpFailedPath": {
+        "defaultValue": "/failed/",
+        "type": "String"
+      },
       "sftpFolderPath": {
         "defaultValue": "/in/",
         "type": "String"
@@ -89,7 +93,7 @@
     "actions": {
       "Check_for_duplicate": {
         "runAfter": {
-          "Compute_dedup_key": [
+          "Scope_Early_Processing": [
             "Succeeded"
           ]
         },
@@ -106,63 +110,6 @@
           },
           "path": "/v2/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('intake-records')}/docs/@{encodeURIComponent(outputs('Compute_dedup_key'))}"
         }
-      },
-      "Get_blob_md5": {
-        "runAfter": {
-          "Upload_to_blob": [
-            "Succeeded"
-          ]
-        },
-        "type": "Http",
-        "inputs": {
-          "method": "HEAD",
-          "uri": "https://@{parameters('storageAccountName')}.blob.core.windows.net/attachments/@{outputs('Generate_file_id')}/@{encodeUriComponent(triggerOutputs()?['headers']['x-ms-file-name'])}",
-          "headers": {
-            "x-ms-version": "2020-10-02"
-          },
-          "authentication": {
-            "type": "ManagedServiceIdentity",
-            "audience": "https://storage.azure.com/"
-          }
-        },
-        "description": "Fetches blob properties via REST API to retrieve Content-MD5 hash (not returned by the managed connector Create blob response)."
-      },
-      "Compute_dedup_key": {
-        "runAfter": {
-          "Get_blob_md5": [
-            "Succeeded"
-          ]
-        },
-        "type": "Compose",
-        "inputs": "@base64(triggerOutputs()?['headers']['x-ms-file-path'])",
-        "description": "Computes base64-encoded dedup key from file path for duplicate detection."
-      },
-      "Generate_file_id": {
-        "runAfter": {
-          "Get_file_content": [
-            "Succeeded"
-          ]
-        },
-        "type": "Compose",
-        "inputs": "sftp-@{guid()}",
-        "description": "Generates a unique file ID for the SFTP record."
-      },
-      "Get_file_content": {
-        "runAfter": {},
-        "type": "ApiConnection",
-        "inputs": {
-          "host": {
-            "connection": {
-              "name": "@parameters('$connections')['sftpwithssh']['connectionId']"
-            }
-          },
-          "method": "get",
-          "path": "/datasets/default/files/@{encodeURIComponent(encodeURIComponent(triggerOutputs()?['headers']['x-ms-file-id']))}/content",
-          "queries": {
-            "inferContentType": true
-          }
-        },
-        "description": "Downloads the file content from the SFTP server."
       },
       "Handle_duplicate_check": {
         "actions": {
@@ -199,7 +146,8 @@
                     "docType": "@{body('Check_for_duplicate')?['docType']}",
                     "docName": "@{body('Check_for_duplicate')?['docName']}",
                     "publishedDate": "@{body('Check_for_duplicate')?['publishedDate']}",
-                    "effectiveDate": "@{body('Check_for_duplicate')?['effectiveDate']}"
+                    "effectiveDate": "@{body('Check_for_duplicate')?['effectiveDate']}",
+                    "disposition": "@{coalesce(body('Check_for_duplicate')?['disposition'], 'processed')}"
                   },
                   "headers": {
                     "x-ms-documentdb-is-upsert": true,
@@ -211,7 +159,7 @@
               },
               "Terminate_duplicate": {
                 "runAfter": {
-                  "Patch_delivery_count": [
+                  "Delete_dup_from_in": [
                     "Succeeded"
                   ]
                 },
@@ -219,6 +167,51 @@
                 "inputs": {
                   "runStatus": "Cancelled"
                 }
+              },
+              "Copy_dup_to_processed": {
+                "type": "ApiConnection",
+                "inputs": {
+                  "host": {
+                    "connection": {
+                      "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+                    }
+                  },
+                  "method": "post",
+                  "path": "/datasets/default/copyFile",
+                  "queries": {
+                    "source": "@triggerOutputs()?['headers']['x-ms-file-path']",
+                    "destination": "@{concat(parameters('sftpArchivePath'), triggerOutputs()?['headers']['x-ms-file-name'])}",
+                    "overwrite": true,
+                    "getFileMetadata": true
+                  }
+                },
+                "description": "Copies true duplicate file from /in/ to /processed/.",
+                "runAfter": {
+                  "Patch_delivery_count": [
+                    "Succeeded"
+                  ]
+                }
+              },
+              "Delete_dup_from_in": {
+                "runAfter": {
+                  "Copy_dup_to_processed": [
+                    "Succeeded"
+                  ]
+                },
+                "type": "ApiConnection",
+                "inputs": {
+                  "host": {
+                    "connection": {
+                      "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+                    }
+                  },
+                  "method": "delete",
+                  "headers": {
+                    "SkipDeleteIfFileNotFoundOnServer": false
+                  },
+                  "path": "/datasets/default/files/@{encodeURIComponent(encodeURIComponent(triggerOutputs()['headers']['x-ms-file-id']))}"
+                },
+                "description": "Deletes duplicate file from /in/ after copy to /processed/."
               }
             },
             "else": {
@@ -306,7 +299,53 @@
                         "code": "DuplicateCheckFailed",
                         "message": "Unexpected error during duplicate check: @{coalesce(actions('Check_for_duplicate')?['error']?['message'], string(outputs('Check_for_duplicate')?['statusCode']), 'Unknown error')}"
                       }
+                    },
+                    "runAfter": {
+                      "Delete_err_from_in": [
+                        "Succeeded"
+                      ]
                     }
+                  },
+                  "Copy_err_to_failed": {
+                    "type": "ApiConnection",
+                    "inputs": {
+                      "host": {
+                        "connection": {
+                          "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+                        }
+                      },
+                      "method": "post",
+                      "path": "/datasets/default/copyFile",
+                      "queries": {
+                        "source": "@triggerOutputs()?['headers']['x-ms-file-path']",
+                        "destination": "@{concat(parameters('sftpFailedPath'), triggerOutputs()?['headers']['x-ms-file-name'])}",
+                        "overwrite": true,
+                        "getFileMetadata": true
+                      }
+                    },
+                    "description": "Copies file to /failed/ on unexpected duplicate-check error.",
+                    "runAfter": {}
+                  },
+                  "Delete_err_from_in": {
+                    "runAfter": {
+                      "Copy_err_to_failed": [
+                        "Succeeded"
+                      ]
+                    },
+                    "type": "ApiConnection",
+                    "inputs": {
+                      "host": {
+                        "connection": {
+                          "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+                        }
+                      },
+                      "method": "delete",
+                      "headers": {
+                        "SkipDeleteIfFileNotFoundOnServer": false
+                      },
+                      "path": "/datasets/default/files/@{encodeURIComponent(encodeURIComponent(triggerOutputs()['headers']['x-ms-file-id']))}"
+                    },
+                    "description": "Deletes file from /in/ after copy to /failed/ on dedup error."
                   }
                 }
               },
@@ -336,67 +375,323 @@
           ]
         },
         "type": "If",
-        "description": "3-way routing: Succeeded → compare contentHash (dup vs update); 404 → new file; other → error."
+        "description": "3-way routing: Succeeded \u00e2\u2020\u2019 compare contentHash (dup vs update); 404 \u00e2\u2020\u2019 new file; other \u00e2\u2020\u2019 error."
       },
-      "Parse_file_extension": {
-        "runAfter": {
-          "Generate_file_id": [
-            "Succeeded"
-          ]
-        },
-        "type": "Compose",
-        "inputs": "@toLower(last(split(triggerOutputs()?['headers']['x-ms-file-name'], '.')))"
-      },
-      "Strip_file_extension": {
-        "runAfter": {
-          "Parse_file_extension": [
-            "Succeeded"
-          ]
-        },
-        "type": "Compose",
-        "inputs": "@first(split(triggerOutputs()?['headers']['x-ms-file-name'], concat('.', outputs('Parse_file_extension'))))",
-        "description": "Removes the file extension to get the base filename for metadata parsing."
-      },
-      "Parse_filename_parts": {
-        "runAfter": {
-          "Strip_file_extension": [
-            "Succeeded"
-          ]
-        },
-        "type": "Compose",
-        "inputs": "@split(outputs('Strip_file_extension'), parameters('filenameDelimiter'))",
-        "description": "Splits base filename by delimiter to extract metadata: [0]Account, [1]Fund, [2]DocType, [3]DocName, [4]PublishedDate, [5]EffectiveDate."
-      },
-      "Upload_to_blob": {
-        "runAfter": {
-          "Parse_filename_parts": [
-            "Succeeded"
-          ]
-        },
-        "type": "ApiConnection",
-        "inputs": {
-          "host": {
-            "connection": {
-              "name": "@parameters('$connections')['azureblob']['connectionId']"
-            }
+      "Scope_Early_Processing": {
+        "runAfter": {},
+        "type": "Scope",
+        "actions": {
+          "Get_file_content": {
+            "runAfter": {},
+            "type": "ApiConnection",
+            "inputs": {
+              "host": {
+                "connection": {
+                  "name": "@parameters('$connections')['sftpwithssh']['connectionId']"
+                }
+              },
+              "method": "get",
+              "path": "/datasets/default/files/@{encodeURIComponent(encodeURIComponent(triggerOutputs()?['headers']['x-ms-file-id']))}/content",
+              "queries": {
+                "inferContentType": true
+              }
+            },
+            "description": "Downloads the file content from the SFTP server."
           },
-          "method": "post",
-          "body": "@body('Get_file_content')",
-          "headers": {
-            "ReadFileMetadataFromServer": true
+          "Generate_file_id": {
+            "runAfter": {
+              "Get_file_content": [
+                "Succeeded"
+              ]
+            },
+            "type": "Compose",
+            "inputs": "sftp-@{guid()}",
+            "description": "Generates a unique file ID for the SFTP record."
           },
-          "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent(parameters('storageAccountName')))}/files",
-          "queries": {
-            "folderPath": "/attachments/@{outputs('Generate_file_id')}",
-            "name": "@triggerOutputs()?['headers']['x-ms-file-name']",
-            "queryParametersSingleEncoded": true
+          "Parse_file_extension": {
+            "runAfter": {
+              "Generate_file_id": [
+                "Succeeded"
+              ]
+            },
+            "type": "Compose",
+            "inputs": "@toLower(last(split(triggerOutputs()?['headers']['x-ms-file-name'], '.')))"
+          },
+          "Strip_file_extension": {
+            "runAfter": {
+              "Parse_file_extension": [
+                "Succeeded"
+              ]
+            },
+            "type": "Compose",
+            "inputs": "@first(split(triggerOutputs()?['headers']['x-ms-file-name'], concat('.', outputs('Parse_file_extension'))))",
+            "description": "Removes the file extension to get the base filename for metadata parsing."
+          },
+          "Parse_filename_parts": {
+            "runAfter": {
+              "Strip_file_extension": [
+                "Succeeded"
+              ]
+            },
+            "type": "Compose",
+            "inputs": "@split(outputs('Strip_file_extension'), parameters('filenameDelimiter'))",
+            "description": "Splits base filename by delimiter to extract metadata: [0]Account, [1]Fund, [2]DocType, [3]DocName, [4]PublishedDate, [5]EffectiveDate."
+          },
+          "Upload_to_blob": {
+            "runAfter": {
+              "Parse_filename_parts": [
+                "Succeeded"
+              ]
+            },
+            "type": "ApiConnection",
+            "inputs": {
+              "host": {
+                "connection": {
+                  "name": "@parameters('$connections')['azureblob']['connectionId']"
+                }
+              },
+              "method": "post",
+              "body": "@body('Get_file_content')",
+              "headers": {
+                "ReadFileMetadataFromServer": true
+              },
+              "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent(parameters('storageAccountName')))}/files",
+              "queries": {
+                "folderPath": "/attachments/@{outputs('Generate_file_id')}",
+                "name": "@triggerOutputs()?['headers']['x-ms-file-name']",
+                "queryParametersSingleEncoded": true
+              }
+            },
+            "description": "Backs up the file to blob storage at /attachments/{fileId}/{filename}."
+          },
+          "Get_blob_md5": {
+            "runAfter": {
+              "Upload_to_blob": [
+                "Succeeded"
+              ]
+            },
+            "type": "Http",
+            "inputs": {
+              "method": "HEAD",
+              "uri": "https://@{parameters('storageAccountName')}.blob.core.windows.net/attachments/@{outputs('Generate_file_id')}/@{encodeUriComponent(triggerOutputs()?['headers']['x-ms-file-name'])}",
+              "headers": {
+                "x-ms-version": "2020-10-02"
+              },
+              "authentication": {
+                "type": "ManagedServiceIdentity",
+                "audience": "https://storage.azure.com/"
+              }
+            },
+            "description": "Fetches blob properties via REST API to retrieve Content-MD5 hash (not returned by the managed connector Create blob response)."
+          },
+          "Compute_dedup_key": {
+            "runAfter": {
+              "Get_blob_md5": [
+                "Succeeded"
+              ]
+            },
+            "type": "Compose",
+            "inputs": "@base64(triggerOutputs()?['headers']['x-ms-file-path'])",
+            "description": "Computes base64-encoded dedup key from file path for duplicate detection."
           }
         },
-        "description": "Backs up the file to blob storage at /attachments/{fileId}/{filename}."
+        "description": "Wraps early processing actions (file download through dedup key computation) for consolidated error handling."
       },
-      "Create_intake_record_if_new": {
+      "Scope_Route_File": {
         "runAfter": {
           "Handle_duplicate_check": [
+            "Succeeded"
+          ]
+        },
+        "type": "Scope",
+        "actions": {
+          "Create_intake_record_if_new": {
+            "runAfter": {},
+            "type": "If",
+            "expression": {
+              "and": [
+                {
+                  "equals": [
+                    "@actions('Check_for_duplicate')['status']",
+                    "Failed"
+                  ]
+                }
+              ]
+            },
+            "actions": {
+              "Create_intake_record": {
+                "type": "ApiConnection",
+                "inputs": {
+                  "host": {
+                    "connection": {
+                      "name": "@parameters('$connections')['documentdb']['connectionId']"
+                    }
+                  },
+                  "method": "post",
+                  "body": {
+                    "id": "@outputs('Compute_dedup_key')",
+                    "partitionKey": "@{concat(parameters('sftpUsername'),'_',formatDateTime(utcNow(),'yyyy-MM'))}",
+                    "intakeSource": "sftp",
+                    "status": "received",
+                    "originalFilename": "@triggerOutputs()?['headers']['x-ms-file-name']",
+                    "fileType": "@outputs('Parse_file_extension')",
+                    "sftpPath": "@triggerOutputs()?['headers']['x-ms-file-path']",
+                    "blobPath": "@{concat('/attachments/', outputs('Generate_file_id'), '/', triggerOutputs()?['headers']['x-ms-file-name'])}",
+                    "dedupKey": "@outputs('Compute_dedup_key')",
+                    "fileSize": "@body('Upload_to_blob')?['Size']",
+                    "contentHash": "@{outputs('Get_blob_md5')['headers']['Content-MD5']}",
+                    "version": 1,
+                    "deliveryCount": 1,
+                    "deliveryHistory": [
+                      {
+                        "deliveredAt": "@{utcNow()}",
+                        "contentHash": "@{outputs('Get_blob_md5')['headers']['Content-MD5']}",
+                        "action": "new"
+                      }
+                    ],
+                    "lastDeliveredAt": "@{utcNow()}",
+                    "receivedAt": "@utcNow()",
+                    "account": "@{outputs('Parse_filename_parts')?[0]}",
+                    "fund": "@{outputs('Parse_filename_parts')?[1]}",
+                    "docType": "@{outputs('Parse_filename_parts')?[2]}",
+                    "docName": "@{outputs('Parse_filename_parts')?[3]}",
+                    "publishedDate": "@{outputs('Parse_filename_parts')?[4]}",
+                    "effectiveDate": "@{outputs('Parse_filename_parts')?[5]}"
+                  },
+                  "headers": {
+                    "x-ms-documentdb-is-upsert": true,
+                    "x-ms-documentdb-raw-partitionkey": "\"@{concat(parameters('sftpUsername'),'_',formatDateTime(utcNow(),'yyyy-MM'))}\""
+                  },
+                  "path": "/v2/cosmosdb/@{encodeURIComponent(parameters('cosmosDbAccountName'))}/dbs/@{encodeURIComponent(parameters('cosmosDbDatabaseName'))}/colls/@{encodeURIComponent('intake-records')}/docs"
+                },
+                "description": "Creates the initial Cosmos DB intake record with parsed metadata, contentHash, version: 1, deliveryCount: 1."
+              }
+            },
+            "else": {
+              "actions": {}
+            },
+            "description": "Only creates a new Cosmos DB record for new files (404). Content updates are already patched in Handle_duplicate_check."
+          },
+          "Check_if_spreadsheet": {
+            "actions": {
+              "Upload_to_SharePoint": {
+                "type": "Http",
+                "inputs": {
+                  "uri": "https://graph.microsoft.com/v1.0/drives/@{parameters('sharepointDriveId')}/root:/@{toUpper(substring(outputs('Parse_filename_parts')?[0], 0, 1))}/@{outputs('Parse_filename_parts')?[0]}/@{outputs('Parse_filename_parts')?[1]}/@{triggerOutputs()?['headers']['x-ms-file-name']}:/content",
+                  "method": "PUT",
+                  "headers": {
+                    "Content-Type": "application/octet-stream"
+                  },
+                  "body": "@body('Get_file_content')",
+                  "authentication": {
+                    "type": "ActiveDirectoryOAuth",
+                    "authority": "",
+                    "tenant": "@{parameters('sharepointTenantId')}",
+                    "audience": "https://graph.microsoft.com",
+                    "clientId": "@{parameters('sharepointClientId')}",
+                    "secret": "@{parameters('sharepointClientSecret')}"
+                  }
+                },
+                "description": "Uploads spreadsheet file to SharePoint via Graph API PUT at /{letter}/{Account}/{Fund}/{filename}."
+              }
+            },
+            "runAfter": {
+              "Create_intake_record_if_new": [
+                "Succeeded"
+              ]
+            },
+            "else": {
+              "actions": {
+                "Check_if_PDF": {
+                  "actions": {
+                    "Compose_Service_Bus_Message": {
+                      "type": "Compose",
+                      "inputs": {
+                        "fileId": "@outputs('Generate_file_id')",
+                        "dedupKey": "@outputs('Compute_dedup_key')",
+                        "originalFilename": "@triggerOutputs()?['headers']['x-ms-file-name']",
+                        "fileType": "pdf",
+                        "blobPath": "@{concat('/attachments/', outputs('Generate_file_id'), '/', triggerOutputs()?['headers']['x-ms-file-name'])}",
+                        "intakeSource": "sftp",
+                        "receivedAt": "@utcNow()",
+                        "sftpPath": "@triggerOutputs()?['headers']['x-ms-file-path']",
+                        "contentHash": "@{outputs('Get_blob_md5')['headers']['Content-MD5']}",
+                        "fileSize": "@body('Upload_to_blob')?['Size']",
+                        "account": "@{outputs('Parse_filename_parts')?[0]}",
+                        "fund": "@{outputs('Parse_filename_parts')?[1]}",
+                        "docType": "@{outputs('Parse_filename_parts')?[2]}",
+                        "docName": "@{outputs('Parse_filename_parts')?[3]}",
+                        "publishedDate": "@{outputs('Parse_filename_parts')?[4]}",
+                        "effectiveDate": "@{outputs('Parse_filename_parts')?[5]}"
+                      },
+                      "description": "Builds the Service Bus message payload for PDF classification. dedupKey matches the Cosmos DB document id."
+                    },
+                    "Send_to_Service_Bus": {
+                      "runAfter": {
+                        "Compose_Service_Bus_Message": [
+                          "Succeeded"
+                        ]
+                      },
+                      "type": "ApiConnection",
+                      "inputs": {
+                        "host": {
+                          "connection": {
+                            "name": "@parameters('$connections')['servicebus']['connectionId']"
+                          }
+                        },
+                        "method": "post",
+                        "body": {
+                          "ContentData": "@{base64(string(outputs('Compose_Service_Bus_Message')))}",
+                          "ContentType": "application/json"
+                        },
+                        "path": "/@{encodeURIComponent(encodeURIComponent('intake'))}/messages"
+                      },
+                      "description": "Sends SFTP intake message to intake queue for PDF classification."
+                    }
+                  },
+                  "else": {
+                    "actions": {
+                      "Log_unsupported_type": {
+                        "type": "Compose",
+                        "inputs": "Unsupported file type '@{outputs('Parse_file_extension')}' for file @{triggerOutputs()?['headers']['x-ms-file-name']}. Skipping.",
+                        "description": "Logs warning for unsupported file types. File is not moved to archive."
+                      }
+                    }
+                  },
+                  "expression": {
+                    "and": [
+                      {
+                        "equals": [
+                          "@outputs('Parse_file_extension')",
+                          "pdf"
+                        ]
+                      }
+                    ]
+                  },
+                  "type": "If",
+                  "description": "Routes PDF files to Service Bus queue for agent classification."
+                }
+              }
+            },
+            "expression": {
+              "and": [
+                {
+                  "contains": [
+                    "@createArray('csv','xls','xlsx')",
+                    "@outputs('Parse_file_extension')"
+                  ]
+                }
+              ]
+            },
+            "type": "If",
+            "description": "Routes spreadsheet files (csv, xls, xlsx) to SharePoint via Graph API."
+          }
+        },
+        "description": "Wraps downstream processing (record creation + file routing) for consolidated error handling."
+      },
+      "Check_if_supported_type": {
+        "runAfter": {
+          "Scope_Route_File": [
             "Succeeded"
           ]
         },
@@ -404,15 +699,40 @@
         "expression": {
           "and": [
             {
-              "equals": [
-                "@actions('Check_for_duplicate')['status']",
-                "Failed"
+              "contains": [
+                "@createArray('csv','xlsx','xls','pdf')",
+                "@outputs('Parse_file_extension')"
               ]
             }
           ]
         },
         "actions": {
-          "Create_intake_record": {
+          "Copy_to_processed": {
+            "type": "ApiConnection",
+            "inputs": {
+              "host": {
+                "connection": {
+                  "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+                }
+              },
+              "method": "post",
+              "path": "/datasets/default/copyFile",
+              "queries": {
+                "source": "@triggerOutputs()?['headers']['x-ms-file-path']",
+                "destination": "@{concat(parameters('sftpArchivePath'), triggerOutputs()?['headers']['x-ms-file-name'])}",
+                "overwrite": true,
+                "getFileMetadata": true
+              }
+            },
+            "description": "Copies the processed file from /in/ to /processed/.",
+            "runAfter": {}
+          },
+          "Update_Cosmos_processed": {
+            "runAfter": {
+              "Copy_to_processed": [
+                "Succeeded"
+              ]
+            },
             "type": "ApiConnection",
             "inputs": {
               "host": {
@@ -425,31 +745,27 @@
                 "id": "@outputs('Compute_dedup_key')",
                 "partitionKey": "@{concat(parameters('sftpUsername'),'_',formatDateTime(utcNow(),'yyyy-MM'))}",
                 "intakeSource": "sftp",
-                "status": "received",
                 "originalFilename": "@triggerOutputs()?['headers']['x-ms-file-name']",
                 "fileType": "@outputs('Parse_file_extension')",
                 "sftpPath": "@triggerOutputs()?['headers']['x-ms-file-path']",
-                "blobPath": "@{concat('/attachments/', outputs('Generate_file_id'), '/', triggerOutputs()?['headers']['x-ms-file-name'])}",
                 "dedupKey": "@outputs('Compute_dedup_key')",
-                "fileSize": "@body('Upload_to_blob')?['Size']",
-                "contentHash": "@{outputs('Get_blob_md5')['headers']['Content-MD5']}",
-                "version": 1,
-                "deliveryCount": 1,
-                "deliveryHistory": [
-                  {
-                    "deliveredAt": "@{utcNow()}",
-                    "contentHash": "@{outputs('Get_blob_md5')['headers']['Content-MD5']}",
-                    "action": "new"
-                  }
-                ],
-                "lastDeliveredAt": "@{utcNow()}",
-                "receivedAt": "@utcNow()",
-                "account": "@{outputs('Parse_filename_parts')?[0]}",
-                "fund": "@{outputs('Parse_filename_parts')?[1]}",
-                "docType": "@{outputs('Parse_filename_parts')?[2]}",
-                "docName": "@{outputs('Parse_filename_parts')?[3]}",
-                "publishedDate": "@{outputs('Parse_filename_parts')?[4]}",
-                "effectiveDate": "@{outputs('Parse_filename_parts')?[5]}"
+                "status": "@if(contains(createArray('csv','xls','xlsx'), outputs('Parse_file_extension')), 'archived', coalesce(body('Create_intake_record')?['status'], body('Patch_content_update')?['status'], body('Check_for_duplicate')?['status']))",
+                "sharepointPath": "@if(contains(createArray('csv','xls','xlsx'), outputs('Parse_file_extension')), coalesce(body('Upload_to_SharePoint')?['webUrl'], ''), '')",
+                "blobPath": "@coalesce(body('Create_intake_record')?['blobPath'], body('Patch_content_update')?['blobPath'], body('Check_for_duplicate')?['blobPath'])",
+                "fileSize": "@coalesce(body('Create_intake_record')?['fileSize'], body('Patch_content_update')?['fileSize'], body('Check_for_duplicate')?['fileSize'])",
+                "receivedAt": "@coalesce(body('Create_intake_record')?['receivedAt'], body('Patch_content_update')?['receivedAt'], body('Check_for_duplicate')?['receivedAt'])",
+                "contentHash": "@coalesce(body('Create_intake_record')?['contentHash'], body('Patch_content_update')?['contentHash'], body('Check_for_duplicate')?['contentHash'])",
+                "version": "@coalesce(body('Create_intake_record')?['version'], body('Patch_content_update')?['version'], body('Check_for_duplicate')?['version'])",
+                "deliveryCount": "@coalesce(body('Create_intake_record')?['deliveryCount'], body('Patch_content_update')?['deliveryCount'], body('Check_for_duplicate')?['deliveryCount'])",
+                "deliveryHistory": "@coalesce(body('Create_intake_record')?['deliveryHistory'], body('Patch_content_update')?['deliveryHistory'], body('Check_for_duplicate')?['deliveryHistory'])",
+                "lastDeliveredAt": "@coalesce(body('Create_intake_record')?['lastDeliveredAt'], body('Patch_content_update')?['lastDeliveredAt'], body('Check_for_duplicate')?['lastDeliveredAt'])",
+                "account": "@coalesce(body('Create_intake_record')?['account'], body('Patch_content_update')?['account'], body('Check_for_duplicate')?['account'])",
+                "fund": "@coalesce(body('Create_intake_record')?['fund'], body('Patch_content_update')?['fund'], body('Check_for_duplicate')?['fund'])",
+                "docType": "@coalesce(body('Create_intake_record')?['docType'], body('Patch_content_update')?['docType'], body('Check_for_duplicate')?['docType'])",
+                "docName": "@coalesce(body('Create_intake_record')?['docName'], body('Patch_content_update')?['docName'], body('Check_for_duplicate')?['docName'])",
+                "publishedDate": "@coalesce(body('Create_intake_record')?['publishedDate'], body('Patch_content_update')?['publishedDate'], body('Check_for_duplicate')?['publishedDate'])",
+                "effectiveDate": "@coalesce(body('Create_intake_record')?['effectiveDate'], body('Patch_content_update')?['effectiveDate'], body('Check_for_duplicate')?['effectiveDate'])",
+                "disposition": "processed"
               },
               "headers": {
                 "x-ms-documentdb-is-upsert": true,
@@ -457,142 +773,169 @@
               },
               "path": "/v2/cosmosdb/@{encodeURIComponent(parameters('cosmosDbAccountName'))}/dbs/@{encodeURIComponent(parameters('cosmosDbDatabaseName'))}/colls/@{encodeURIComponent('intake-records')}/docs"
             },
-            "description": "Creates the initial Cosmos DB intake record with parsed metadata, contentHash, version: 1, deliveryCount: 1."
-          }
-        },
-        "else": {
-          "actions": {}
-        },
-        "description": "Only creates a new Cosmos DB record for new files (404). Content updates are already patched in Handle_duplicate_check."
-      },
-      "Check_if_spreadsheet": {
-        "actions": {
-          "Upload_to_SharePoint": {
-            "type": "Http",
-            "inputs": {
-              "uri": "https://graph.microsoft.com/v1.0/drives/@{parameters('sharepointDriveId')}/root:/@{toUpper(substring(outputs('Parse_filename_parts')?[0], 0, 1))}/@{outputs('Parse_filename_parts')?[0]}/@{outputs('Parse_filename_parts')?[1]}/@{triggerOutputs()?['headers']['x-ms-file-name']}:/content",
-              "method": "PUT",
-              "headers": {
-                "Content-Type": "application/octet-stream"
-              },
-              "body": "@body('Get_file_content')",
-              "authentication": {
-                "type": "ActiveDirectoryOAuth",
-                "authority": "",
-                "tenant": "@{parameters('sharepointTenantId')}",
-                "audience": "https://graph.microsoft.com",
-                "clientId": "@{parameters('sharepointClientId')}",
-                "secret": "@{parameters('sharepointClientSecret')}"
-              }
+            "description": "Updates Cosmos DB record with disposition: processed."
+          },
+          "Delete_from_in": {
+            "runAfter": {
+              "Update_Cosmos_processed": [
+                "Succeeded"
+              ]
             },
-            "description": "Uploads spreadsheet file to SharePoint via Graph API PUT at /{letter}/{Account}/{Fund}/{filename}."
+            "type": "ApiConnection",
+            "inputs": {
+              "host": {
+                "connection": {
+                  "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+                }
+              },
+              "method": "delete",
+              "headers": {
+                "SkipDeleteIfFileNotFoundOnServer": false
+              },
+              "path": "/datasets/default/files/@{encodeURIComponent(encodeURIComponent(triggerOutputs()['headers']['x-ms-file-id']))}"
+            },
+            "description": "Deletes the file from SFTP /in/ after successful disposition to /processed/."
+          },
+          "Terminate_success": {
+            "runAfter": {
+              "Delete_from_in": [
+                "Succeeded"
+              ]
+            },
+            "type": "Terminate",
+            "inputs": {
+              "runStatus": "Succeeded"
+            },
+            "description": "Terminates with Succeeded after successful processing and disposition."
           }
-        },
-        "runAfter": {
-          "Create_intake_record_if_new": [
-            "Succeeded"
-          ]
         },
         "else": {
           "actions": {
-            "Check_if_PDF": {
-              "actions": {
-                "Compose_Service_Bus_Message": {
-                  "type": "Compose",
-                  "inputs": {
-                    "fileId": "@outputs('Generate_file_id')",
-                    "originalFilename": "@triggerOutputs()?['headers']['x-ms-file-name']",
-                    "fileType": "pdf",
-                    "blobPath": "@{concat('/attachments/', outputs('Generate_file_id'), '/', triggerOutputs()?['headers']['x-ms-file-name'])}",
-                    "intakeSource": "sftp",
-                    "receivedAt": "@utcNow()",
-                    "sftpPath": "@triggerOutputs()?['headers']['x-ms-file-path']",
-                    "contentHash": "@{outputs('Get_blob_md5')['headers']['Content-MD5']}",
-                    "fileSize": "@body('Upload_to_blob')?['Size']",
-                    "account": "@{outputs('Parse_filename_parts')?[0]}",
-                    "fund": "@{outputs('Parse_filename_parts')?[1]}",
-                    "docType": "@{outputs('Parse_filename_parts')?[2]}",
-                    "docName": "@{outputs('Parse_filename_parts')?[3]}",
-                    "publishedDate": "@{outputs('Parse_filename_parts')?[4]}",
-                    "effectiveDate": "@{outputs('Parse_filename_parts')?[5]}"
-                  },
-                  "description": "Builds the Service Bus message payload for PDF classification."
+            "Delete_unsupported_from_in": {
+              "runAfter": {},
+              "type": "ApiConnection",
+              "inputs": {
+                "host": {
+                  "connection": {
+                    "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+                  }
                 },
-                "Send_to_Service_Bus": {
-                  "runAfter": {
-                    "Compose_Service_Bus_Message": [
-                      "Succeeded"
-                    ]
-                  },
-                  "type": "ApiConnection",
-                  "inputs": {
-                    "host": {
-                      "connection": {
-                        "name": "@parameters('$connections')['servicebus']['connectionId']"
-                      }
-                    },
-                    "method": "post",
-                    "body": {
-                      "ContentData": "@{base64(string(outputs('Compose_Service_Bus_Message')))}",
-                      "ContentType": "application/json"
-                    },
-                    "path": "/@{encodeURIComponent(encodeURIComponent('email-intake'))}/messages"
-                  },
-                  "description": "Sends SFTP intake message to email-intake queue for PDF classification."
-                }
+                "method": "delete",
+                "headers": {
+                  "SkipDeleteIfFileNotFoundOnServer": false
+                },
+                "path": "/datasets/default/files/@{encodeURIComponent(encodeURIComponent(triggerOutputs()['headers']['x-ms-file-id']))}"
               },
-              "else": {
-                "actions": {
-                  "Log_unsupported_type": {
-                    "type": "Compose",
-                    "inputs": "Unsupported file type '@{outputs('Parse_file_extension')}' for file @{triggerOutputs()?['headers']['x-ms-file-name']}. Skipping.",
-                    "description": "Logs warning for unsupported file types. File is not moved to archive."
-                  }
-                }
-              },
-              "expression": {
-                "and": [
-                  {
-                    "equals": [
-                      "@outputs('Parse_file_extension')",
-                      "pdf"
-                    ]
-                  }
+              "description": "Deletes unsupported file from /in/ (matching existing delete behavior)."
+            },
+            "Terminate_skipped": {
+              "runAfter": {
+                "Delete_unsupported_from_in": [
+                  "Succeeded"
                 ]
               },
-              "type": "If",
-              "description": "Routes PDF files to Service Bus queue for agent classification."
+              "type": "Terminate",
+              "inputs": {
+                "runStatus": "Succeeded"
+              },
+              "description": "Unsupported file type \u2014 deleted from /in/, no disposition set."
             }
           }
         },
-        "expression": {
-          "and": [
-            {
-              "contains": [
-                "@createArray('csv','xls','xlsx')",
-                "@outputs('Parse_file_extension')"
-              ]
-            }
-          ]
-        },
-        "type": "If",
-        "description": "Routes spreadsheet files (csv, xls, xlsx) to SharePoint via Graph API."
+        "description": "Routes supported types (csv, xlsx, xls, pdf) to success disposition. Unsupported types are deleted from /in/."
       },
-      "Terminate_success": {
+      "Copy_to_failed": {
+        "type": "ApiConnection",
+        "inputs": {
+          "host": {
+            "connection": {
+              "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+            }
+          },
+          "method": "post",
+          "path": "/datasets/default/copyFile",
+          "queries": {
+            "source": "@triggerOutputs()?['headers']['x-ms-file-path']",
+            "destination": "@{concat(parameters('sftpFailedPath'), triggerOutputs()?['headers']['x-ms-file-name'])}",
+            "overwrite": true,
+            "getFileMetadata": true
+          }
+        },
+        "description": "Copies file to /failed/ when downstream processing fails.",
         "runAfter": {
-          "Delete_file": [
+          "Scope_Route_File": [
+            "Failed",
+            "TimedOut"
+          ]
+        }
+      },
+      "Filter_failed_actions": {
+        "runAfter": {
+          "Copy_to_failed": [
             "Succeeded"
           ]
         },
-        "type": "Terminate",
+        "type": "Query",
         "inputs": {
-          "runStatus": "Succeeded"
+          "from": "@result('Scope_Route_File')",
+          "where": "@equals(item()['status'], 'Failed')"
         },
-        "description": "Overrides run status to Succeeded after the new-file processing path completes. Required because Check_for_duplicate returns 404 (Failed action) for new files."
+        "description": "Filters Scope_Route_File results to find the failed action for error details."
       },
-      "Delete_file": {
+      "Update_Cosmos_failed": {
         "runAfter": {
-          "Check_if_spreadsheet": [
+          "Filter_failed_actions": [
+            "Succeeded"
+          ]
+        },
+        "type": "ApiConnection",
+        "inputs": {
+          "host": {
+            "connection": {
+              "name": "@parameters('$connections')['documentdb']['connectionId']"
+            }
+          },
+          "method": "post",
+          "body": {
+            "id": "@outputs('Compute_dedup_key')",
+            "partitionKey": "@{concat(parameters('sftpUsername'),'_',formatDateTime(utcNow(),'yyyy-MM'))}",
+            "intakeSource": "sftp",
+            "originalFilename": "@triggerOutputs()?['headers']['x-ms-file-name']",
+            "fileType": "@outputs('Parse_file_extension')",
+            "sftpPath": "@triggerOutputs()?['headers']['x-ms-file-path']",
+            "dedupKey": "@outputs('Compute_dedup_key')",
+            "status": "error",
+            "blobPath": "@coalesce(body('Create_intake_record')?['blobPath'], body('Patch_content_update')?['blobPath'], body('Check_for_duplicate')?['blobPath'])",
+            "fileSize": "@coalesce(body('Create_intake_record')?['fileSize'], body('Patch_content_update')?['fileSize'], body('Check_for_duplicate')?['fileSize'])",
+            "receivedAt": "@coalesce(body('Create_intake_record')?['receivedAt'], body('Patch_content_update')?['receivedAt'], body('Check_for_duplicate')?['receivedAt'])",
+            "contentHash": "@coalesce(body('Create_intake_record')?['contentHash'], body('Patch_content_update')?['contentHash'], body('Check_for_duplicate')?['contentHash'])",
+            "version": "@coalesce(body('Create_intake_record')?['version'], body('Patch_content_update')?['version'], body('Check_for_duplicate')?['version'])",
+            "deliveryCount": "@coalesce(body('Create_intake_record')?['deliveryCount'], body('Patch_content_update')?['deliveryCount'], body('Check_for_duplicate')?['deliveryCount'])",
+            "deliveryHistory": "@coalesce(body('Create_intake_record')?['deliveryHistory'], body('Patch_content_update')?['deliveryHistory'], body('Check_for_duplicate')?['deliveryHistory'])",
+            "lastDeliveredAt": "@coalesce(body('Create_intake_record')?['lastDeliveredAt'], body('Patch_content_update')?['lastDeliveredAt'], body('Check_for_duplicate')?['lastDeliveredAt'])",
+            "account": "@coalesce(body('Create_intake_record')?['account'], body('Patch_content_update')?['account'], body('Check_for_duplicate')?['account'])",
+            "fund": "@coalesce(body('Create_intake_record')?['fund'], body('Patch_content_update')?['fund'], body('Check_for_duplicate')?['fund'])",
+            "docType": "@coalesce(body('Create_intake_record')?['docType'], body('Patch_content_update')?['docType'], body('Check_for_duplicate')?['docType'])",
+            "docName": "@coalesce(body('Create_intake_record')?['docName'], body('Patch_content_update')?['docName'], body('Check_for_duplicate')?['docName'])",
+            "publishedDate": "@coalesce(body('Create_intake_record')?['publishedDate'], body('Patch_content_update')?['publishedDate'], body('Check_for_duplicate')?['publishedDate'])",
+            "effectiveDate": "@coalesce(body('Create_intake_record')?['effectiveDate'], body('Patch_content_update')?['effectiveDate'], body('Check_for_duplicate')?['effectiveDate'])",
+            "disposition": "failed",
+            "errorDetails": {
+              "actionName": "@{coalesce(first(body('Filter_failed_actions'))?['name'], 'Unknown')}",
+              "errorMessage": "@{coalesce(first(body('Filter_failed_actions'))?['error']?['message'], 'Unknown error in downstream processing')}"
+            }
+          },
+          "headers": {
+            "x-ms-documentdb-is-upsert": true,
+            "x-ms-documentdb-raw-partitionkey": "\"@{concat(parameters('sftpUsername'),'_',formatDateTime(utcNow(),'yyyy-MM'))}\""
+          },
+          "path": "/v2/cosmosdb/@{encodeURIComponent(parameters('cosmosDbAccountName'))}/dbs/@{encodeURIComponent(parameters('cosmosDbDatabaseName'))}/colls/@{encodeURIComponent('intake-records')}/docs"
+        },
+        "description": "Updates Cosmos DB record with status: error, disposition: failed, and errorDetails."
+      },
+      "Delete_from_in_on_failure": {
+        "runAfter": {
+          "Update_Cosmos_failed": [
             "Succeeded"
           ]
         },
@@ -609,7 +952,85 @@
           },
           "path": "/datasets/default/files/@{encodeURIComponent(encodeURIComponent(triggerOutputs()['headers']['x-ms-file-id']))}"
         },
-        "description": "Deletes the original file from SFTP /in/ after successful processing. Uses file ID (not path) to avoid UTF-8 filename encoding issues. File content is already archived in blob storage."
+        "description": "Deletes file from /in/ after copy to /failed/ on processing failure."
+      },
+      "Terminate_failed": {
+        "runAfter": {
+          "Delete_from_in_on_failure": [
+            "Succeeded"
+          ]
+        },
+        "type": "Terminate",
+        "inputs": {
+          "runStatus": "Failed",
+          "runError": {
+            "code": "ProcessingFailed",
+            "message": "@{coalesce(first(body('Filter_failed_actions'))?['error']?['message'], 'Processing failed in Scope_Route_File')}"
+          }
+        },
+        "description": "Terminates with Failed status after file disposition to /failed/."
+      },
+      "Copy_early_to_failed": {
+        "type": "ApiConnection",
+        "inputs": {
+          "host": {
+            "connection": {
+              "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+            }
+          },
+          "method": "post",
+          "path": "/datasets/default/copyFile",
+          "queries": {
+            "source": "@triggerOutputs()?['headers']['x-ms-file-path']",
+            "destination": "@{concat(parameters('sftpFailedPath'), triggerOutputs()?['headers']['x-ms-file-name'])}",
+            "overwrite": true,
+            "getFileMetadata": true
+          }
+        },
+        "description": "Copies file to /failed/ when early processing fails (before dedup key computation).",
+        "runAfter": {
+          "Scope_Early_Processing": [
+            "Failed",
+            "TimedOut"
+          ]
+        }
+      },
+      "Delete_early_from_in": {
+        "runAfter": {
+          "Copy_early_to_failed": [
+            "Succeeded"
+          ]
+        },
+        "type": "ApiConnection",
+        "inputs": {
+          "host": {
+            "connection": {
+              "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+            }
+          },
+          "method": "delete",
+          "headers": {
+            "SkipDeleteIfFileNotFoundOnServer": false
+          },
+          "path": "/datasets/default/files/@{encodeURIComponent(encodeURIComponent(triggerOutputs()['headers']['x-ms-file-id']))}"
+        },
+        "description": "Deletes file from /in/ after copy to /failed/ on early failure."
+      },
+      "Terminate_early_failed": {
+        "runAfter": {
+          "Delete_early_from_in": [
+            "Succeeded"
+          ]
+        },
+        "type": "Terminate",
+        "inputs": {
+          "runStatus": "Failed",
+          "runError": {
+            "code": "EarlyProcessingFailed",
+            "message": "@{coalesce(actions('Scope_Early_Processing')?['error']?['message'], 'Early processing failed before dedup key computation')}"
+          }
+        },
+        "description": "Terminates with Failed after early processing failure. No Cosmos DB update (metadata not yet computed)."
       }
     },
     "outputs": {}

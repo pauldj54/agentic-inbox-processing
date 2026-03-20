@@ -262,7 +262,7 @@ class CosmosDBTools:
                 # Determine status and queue based on 65% confidence threshold
                 pipeline_mode = classification_details.get("pipelineMode", "full")
                 if pipeline_mode == "triage-only":
-                    doc["status"] = "processed"
+                    doc["status"] = "triaged"
                     doc["queue"] = classification_details.get("targetQueue", os.environ.get("TRIAGE_COMPLETE_QUEUE", "triage-complete"))
                 elif classification == "Not PE Related":
                     doc["status"] = "discarded"

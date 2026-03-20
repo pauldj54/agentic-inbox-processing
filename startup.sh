@@ -7,8 +7,15 @@ cd /home/site/wwwroot
 # Ensure the app root is on Python's module path
 export PYTHONPATH="/home/site/wwwroot:$PYTHONPATH"
 
-# Install dependencies if needed
-pip install -r requirements.txt
+echo "=== Startup: $(date -u) ==="
+echo "Python: $(python --version 2>&1)"
 
-# Start the application
-gunicorn src.webapp.main:app --workers 2 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000
+# Start the application (1 worker to avoid duplicate agent background threads)
+# --timeout 120 for slow MI token acquisition on first request
+gunicorn src.webapp.main:app \
+    --workers 1 \
+    --worker-class uvicorn.workers.UvicornWorker \
+    --bind 0.0.0.0:8000 \
+    --timeout 120 \
+    --access-logfile - \
+    --error-logfile -

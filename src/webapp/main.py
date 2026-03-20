@@ -4,6 +4,7 @@ Displays emails from Cosmos DB and messages from Service Bus queues.
 """
 
 import os
+import threading
 from pathlib import Path
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -39,7 +40,7 @@ SERVICEBUS_NAMESPACE = os.environ["SERVICEBUS_NAMESPACE"]
 
 # Queue names (simplified pipeline)
 QUEUE_NAMES = [
-    "email-intake",      # Incoming emails
+    os.environ.get("INTAKE_QUEUE", "intake"),      # Incoming emails + SFTP PDFs
     os.environ.get("DISCARDED_QUEUE", "discarded"),         # Non-PE emails
     os.environ.get("HUMAN_REVIEW_QUEUE", "human-review"),      # Low confidence (<65%)
     os.environ.get("ARCHIVAL_PENDING_QUEUE", "archival-pending"),  # Ready for archival (>=65%)
@@ -56,12 +57,42 @@ credential = None
 cosmos_client = None
 servicebus_client = None
 executor = None
+_agent_thread = None
+
+
+def _agent_worker():
+    """Background worker that processes emails from the intake queue."""
+    import time
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    print("Agent worker thread started")
+
+    while True:
+        try:
+            from src.agents.email_classifier_agent import EmailClassificationAgent
+            agent = EmailClassificationAgent()
+            print("Agent initialized successfully")
+
+            while True:
+                try:
+                    result = loop.run_until_complete(agent.process_next_email())
+                    if result:
+                        print(f"Agent processed: {result.get('email_id', 'N/A')[:30]} -> {result.get('routed_to', 'N/A')}")
+                    else:
+                        time.sleep(10)
+                except Exception as e:
+                    print(f"Agent processing error: {e}")
+                    time.sleep(10)
+        except Exception as e:
+            print(f"Agent initialization error (retrying in 30s): {e}")
+            time.sleep(30)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup sync clients."""
-    global credential, cosmos_client, servicebus_client, executor
+    global credential, cosmos_client, servicebus_client, executor, _agent_thread
     
     # Use DefaultAzureCredential (tries multiple auth methods)
     credential = DefaultAzureCredential()
@@ -71,6 +102,15 @@ async def lifespan(app: FastAPI):
         credential=credential
     )
     executor = ThreadPoolExecutor(max_workers=2)  # Reduce workers to avoid auth conflicts
+
+    # Start agent background thread if AI endpoint is configured
+    ai_endpoint = os.environ.get("AZURE_AI_PROJECT_ENDPOINT")
+    if ai_endpoint:
+        _agent_thread = threading.Thread(target=_agent_worker, daemon=True, name="agent-worker")
+        _agent_thread.start()
+        print(f"Agent background thread started (endpoint: {ai_endpoint[:50]}...)")
+    else:
+        print("AZURE_AI_PROJECT_ENDPOINT not set - agent worker not started")
     
     yield
     
@@ -231,23 +271,22 @@ def _get_emails_from_cosmos_sync(limit: int = 20) -> list:
         database = cosmos_client.get_database_client(COSMOS_DATABASE)
         container = database.get_container_client("intake-records")
         
-        query = """
-            SELECT TOP @limit *
-            FROM c
-            ORDER BY c.receivedAt DESC
-        """
+        # Simple query without ORDER BY — cross-partition ORDER BY can fail
+        # if the container lacks a composite index on receivedAt.
+        query = "SELECT * FROM c"
         
         emails = []
         for item in container.query_items(
             query=query,
-            parameters=[{"name": "@limit", "value": limit}],
             enable_cross_partition_query=True
         ):
             if "intakeSource" not in item:
                 item["intakeSource"] = "email"
             emails.append(item)
         
-        return emails
+        # Sort client-side and limit
+        emails.sort(key=lambda x: x.get("receivedAt", ""), reverse=True)
+        return emails[:limit]
     except Exception as e:
         print(f"Error fetching emails from Cosmos DB: {e}")
         return []

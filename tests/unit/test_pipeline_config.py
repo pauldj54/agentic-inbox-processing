@@ -98,7 +98,7 @@ class TestPipelineModeRouting:
         agent.queue_tools.receive_email_from_intake.return_value = {
             "body": email_data,
         }
-        agent.queue_tools.QUEUE_EMAIL_INTAKE = "email-intake"
+        agent.queue_tools.QUEUE_EMAIL_INTAKE = "intake"
         agent.queue_tools.triage_queue = "triage-complete"
         agent.queue_tools.route_email.return_value = "archival-pending"
 
@@ -158,7 +158,7 @@ class TestPipelineModeRouting:
         agent.queue_tools.receive_email_from_intake.return_value = {
             "body": email_data,
         }
-        agent.queue_tools.QUEUE_EMAIL_INTAKE = "email-intake"
+        agent.queue_tools.QUEUE_EMAIL_INTAKE = "intake"
         agent.queue_tools.triage_queue = "triage-complete"
         agent.queue_tools.send_to_triage_queue.return_value = "triage-complete"
 
