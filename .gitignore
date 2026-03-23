@@ -169,3 +169,7 @@ partner-reader-ed25519
 partner-reader-ed25519.pub
 partner-reader-ed25519_new.pub
 partner-reader-rsa
+
+# Webapp logs — generated at runtime
+webapp_logs/
+webapp_logs*.zip
