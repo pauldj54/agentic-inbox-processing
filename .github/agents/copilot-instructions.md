@@ -14,6 +14,8 @@ Auto-generated from all feature plans. Last updated: 2026-02-26
 - Cosmos DB (`email-processing` db, `intake-records` collection), Azure Blob Storage (`stdocprocdevizr2ch55`), SFTP (`sftpprocdevizr2ch55`) (003-sftp-intake)
 - Logic Apps (Consumption tier, Azure) — workflow JSON definition + Logic App managed connectors (SFTP-SSH for copy/delete, Cosmos DB for record updates) (004-sftp-file-disposition)
 - Cosmos DB (`email-processing` db, `intake-records` container), SFTP server (`sftpprocdevizr2ch55`) (004-sftp-file-disposition)
+- Python 3.12+ + azure-servicebus (>=7.12.0, existing), azure-identity (>=1.15.0, existing), requests (new — HTTP client for API calls), python-dotenv (existing) (005-triage-consumer)
+- N/A — reads from Azure Service Bus queue, posts to external HTTP API. No local or cloud persistence. (005-triage-consumer)
 
 - Python 3.12+ + FastAPI, azure-identity, azure-cosmos, azure-servicebus, azure-ai-agents, azure-ai-documentintelligence, azure-storage-blob (new), aiohttp, jinja2 (001-download-link-intake)
 
@@ -34,7 +36,7 @@ cd src; pytest; ruff check .
 Python 3.12+: Follow standard conventions
 
 ## Recent Changes
-- 004-sftp-file-disposition: Added Logic Apps (Consumption tier, Azure) — workflow JSON definition + Logic App managed connectors (SFTP-SSH for copy/delete, Cosmos DB for record updates)
+- 005-triage-consumer: Added Python 3.12+ + azure-servicebus (>=7.12.0, existing), azure-identity (>=1.15.0, existing), requests (new — HTTP client for API calls), python-dotenv (existing)
 - 004-sftp-file-disposition: Added Logic Apps (Consumption tier, Azure) — workflow JSON definition + Logic App managed connectors (SFTP-SSH for copy/delete, Cosmos DB for record updates)
 - 004-sftp-file-disposition: Added Logic Apps (Consumption tier, Azure) — workflow JSON definition + Logic App managed connectors (SFTP-SSH for copy/delete, Cosmos DB for record updates)
 

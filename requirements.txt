@@ -32,5 +32,8 @@ uvicorn[standard]>=0.27.0
 gunicorn>=21.0.0
 jinja2>=3.1.0
 
+# HTTP client (triage consumer API forwarding — see 005-triage-consumer R-005)
+requests>=2.31.0
+
 # Environment configuration
 python-dotenv>=1.0.0

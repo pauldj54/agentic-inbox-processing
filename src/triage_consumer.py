@@ -12,6 +12,7 @@ Usage:
 """
 
 import os
+import sys
 import json
 import logging
 from pathlib import Path
@@ -82,6 +83,8 @@ def print_message_details(message_data: dict):
         print(f"📌 Subject: {message_data['subject']}")
     if message_data.get("originalFilename"):
         print(f"📄 Original Filename: {message_data['originalFilename']}")
+    if message_data.get("fileType"):
+        print(f"📁 File Type: {message_data['fileType']}")
     
     # Sender info (for emails)
     from_info = message_data.get("from", message_data.get("from_name", "N/A"))
@@ -394,7 +397,8 @@ def run_consumer_loop():
     except KeyboardInterrupt:
         logger.info("\n\n🛑 Consumer stopped by user")
     except Exception as e:
-        logger.error(f"❌ Fatal error in consumer loop: {e}", exc_info=True)
+        logger.error(f"❌ Fatal error: {e}", exc_info=True)
+        sys.exit(1)
     finally:
         logger.info("🔌 Closing Service Bus connection...")
         logger.info("👋 Goodbye!")
