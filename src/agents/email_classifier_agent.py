@@ -109,7 +109,7 @@ class EmailClassificationAgent:
         self.graph_tools = GraphAPITools()
         self.doc_intel_tool = DocumentIntelligenceTool()
         self.cosmos_tools = CosmosDBTools()
-        self.link_download_tool = LinkDownloadTool()
+        self.link_download_tool = LinkDownloadTool(cosmos_tools=self.cosmos_tools)
         
         # Pipeline mode configuration
         self.pipeline_mode = os.getenv("PIPELINE_MODE", "full")
@@ -305,9 +305,11 @@ class EmailClassificationAgent:
                     if not email_body_for_links:
                         # Fallback to Service Bus fields if Cosmos body unavailable
                         email_body_for_links = email_data.get("bodyText", "") or email_data.get("emailBody", "")
+                    link_partition_key = cosmos_doc.get("partitionKey") if cosmos_doc else None
                     link_result = await self.link_download_tool.process_email_links(
                         email_id=email_id,
                         email_body=email_body_for_links,
+                        partition_key=link_partition_key,
                     )
 
                     if link_result.downloaded_files:
@@ -465,6 +467,29 @@ class EmailClassificationAgent:
                     email_data=email_data,
                 )
 
+                # ── PE EVENT UPSERT (triage-only) ──
+                # Create/update a PE event record so the dashboard shows Unique Events
+                initial_cat = relevance_result.get("initial_category", "")
+                if initial_cat and initial_cat != NON_PE_CATEGORY:
+                    try:
+                        pe_event, is_dup = self.cosmos_tools.find_or_create_pe_event(
+                            email_id=email_id,
+                            classification_details={
+                                "category": initial_cat,
+                                "pe_company": relevance_result.get("pe_company", "Unknown"),
+                                "fund_name": relevance_result.get("fund_name", "Unknown"),
+                                "confidence": relevance_result.get("confidence", 0.0),
+                                "reasoning": relevance_result.get("reasoning", ""),
+                                "key_evidence": relevance_result.get("key_evidence", []),
+                            },
+                            intake_source=intake_source,
+                            received_at=email_data.get("receivedAt", email_data.get("received_at", "")),
+                        )
+                        pe_event_id = pe_event.get("id") if pe_event else None
+                        logger.info(f"PE event {'linked' if is_dup else 'created'}: {pe_event_id} (triage-only)")
+                    except Exception as e:
+                        logger.warning(f"Failed to upsert PE event in triage-only mode: {e}")
+
                 self.cosmos_tools.log_classification_event(
                     email_id=email_id,
                     event_type="triage_complete",
@@ -523,7 +548,9 @@ class EmailClassificationAgent:
                 try:
                     pe_event, is_duplicate = self.cosmos_tools.find_or_create_pe_event(
                         email_id=email_id,
-                        classification_details=classification_result
+                        classification_details=classification_result,
+                        intake_source=intake_source,
+                        received_at=email_data.get("receivedAt", email_data.get("received_at", "")),
                     )
                     pe_event_id = pe_event.get("id") if pe_event else None
                     

@@ -216,21 +216,23 @@ class QueueTools:
                 has_attachments = val == "true"
             
             # Extract attachmentPaths array - this is CRITICAL for PE classification
-            # Supports both legacy string format and new object format {path, source}
+            # Supports both legacy string format and new object format {path, source, contentMd5, originalName}
             attachment_paths = []
             attachment_paths_match = re.search(r'"attachmentPaths":\s*\[(.*?)\]', body_str, re.DOTALL)
             if attachment_paths_match:
                 paths_content = attachment_paths_match.group(1).strip()
                 if paths_content:
-                    # Try to detect object format: look for {"path": ...}
-                    object_matches = re.findall(
-                        r'\{\s*"path"\s*:\s*"([^"]+)"\s*,\s*"source"\s*:\s*"([^"]+)"\s*\}',
-                        paths_content
-                    )
-                    if object_matches:
-                        # New object format: [{"path": "...", "source": "..."}]
-                        attachment_paths = [{"path": m[0], "source": m[1]} for m in object_matches]
-                    else:
+                    # Try to parse individual JSON objects (handles any number of properties)
+                    object_pattern = re.compile(r'\{[^}]+\}')
+                    for obj_match in object_pattern.finditer(paths_content):
+                        try:
+                            obj = json.loads(obj_match.group())
+                            if 'path' in obj:
+                                attachment_paths.append(obj)
+                        except json.JSONDecodeError:
+                            continue
+                    
+                    if not attachment_paths:
                         # Legacy string format: ["path1", "path2"]
                         path_matches = re.findall(r'"([^"]+)"', paths_content)
                         attachment_paths = [{"path": p, "source": "attachment"} for p in path_matches]

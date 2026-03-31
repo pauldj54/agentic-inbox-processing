@@ -7,7 +7,7 @@ import os
 import threading
 from pathlib import Path
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -390,19 +390,33 @@ async def get_queue_messages(queue_name: str, max_count: int = 10) -> list:
     return await loop.run_in_executor(executor, _get_queue_messages_sync, queue_name, max_count)
 
 
-def _get_pe_event_stats_sync() -> dict:
+def _get_pe_event_stats_sync(date_from: str = None, date_to: str = None) -> dict:
     """Get PE event statistics (sync).
     
     Uses client-side aggregation because the Cosmos DB SDK version
     does not support GROUP BY / multiple aggregates.
     """
+    # Normalization map: classifier variants → canonical PE_CATEGORIES names
+    EVENT_TYPE_NORMALIZATION = {
+        "capital call (drawdown notice)": "Capital Call",
+        "capital call (drawdown)": "Capital Call",
+        "drawdown notice": "Capital Call",
+        "distribution": "Distribution Notice",
+    }
+
+    def _normalize_event_type(raw: str) -> str:
+        if not raw:
+            return "Unknown"
+        key = raw.strip().lower()
+        return EVENT_TYPE_NORMALIZATION.get(key, raw.strip())
+
     try:
         database = cosmos_client.get_database_client(COSMOS_DATABASE)
         container = database.get_container_client("pe-events")
         
         # Fetch all pe-events and aggregate client-side
         # (avoids GROUP BY which requires a newer SDK gateway mode)
-        query = "SELECT c.eventType, c.emailCount FROM c"
+        query = "SELECT c.eventType, c.emailCount, c.createdAt FROM c"
         
         stats = {
             "byEventType": {},
@@ -415,7 +429,14 @@ def _get_pe_event_stats_sync() -> dict:
             query=query,
             enable_cross_partition_query=True
         ):
-            event_type = item.get("eventType", "Unknown")
+            # Date filtering (client-side)
+            created = item.get("createdAt", "")
+            if date_from and created < date_from:
+                continue
+            if date_to and created > date_to:
+                continue
+
+            event_type = _normalize_event_type(item.get("eventType", "Unknown"))
             email_count = item.get("emailCount", 0) or 0
             
             if event_type not in stats["byEventType"]:
@@ -434,21 +455,113 @@ def _get_pe_event_stats_sync() -> dict:
         return None
 
 
-async def get_pe_event_stats() -> dict:
+def _get_intake_stats_sync(date_from: str = None, date_to: str = None) -> dict:
+    """Get intake record counts for emails and SFTP, with duplicate breakdowns.
+    
+    Duplicates are derived from deliveryCount: each record with deliveryCount > 1
+    contributed (deliveryCount - 1) duplicate deliveries that were suppressed.
+    """
+    try:
+        database = cosmos_client.get_database_client(COSMOS_DATABASE)
+        container = database.get_container_client("intake-records")
+
+        query = "SELECT c.intakeSource, c.deliveryCount, c.receivedAt FROM c"
+        stats = {
+            "emailTotal": 0,
+            "emailDuplicate": 0,
+            "sftpTotal": 0,
+            "sftpDuplicate": 0,
+        }
+
+        for item in container.query_items(
+            query=query,
+            enable_cross_partition_query=True,
+        ):
+            received = item.get("receivedAt", "")
+            if date_from and received < date_from:
+                continue
+            if date_to and received > date_to:
+                continue
+
+            source = item.get("intakeSource", "email")
+            dc = item.get("deliveryCount", 1) or 1
+            dup_count = max(0, dc - 1)
+
+            if source == "sftp":
+                stats["sftpTotal"] += 1
+                stats["sftpDuplicate"] += dup_count
+            else:
+                stats["emailTotal"] += 1
+                stats["emailDuplicate"] += dup_count
+
+        stats["combinedTotal"] = stats["emailTotal"] + stats["sftpTotal"]
+        stats["combinedDuplicate"] = stats["emailDuplicate"] + stats["sftpDuplicate"]
+        return stats
+
+    except Exception as e:
+        print(f"Error getting intake stats: {e}")
+        return {
+            "emailTotal": 0, "emailDuplicate": 0,
+            "sftpTotal": 0, "sftpDuplicate": 0,
+            "combinedTotal": 0, "combinedDuplicate": 0,
+        }
+
+
+async def get_pe_event_stats(date_from: str = None, date_to: str = None) -> dict:
     """Get PE event statistics."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(executor, _get_pe_event_stats_sync)
+    return await loop.run_in_executor(executor, _get_pe_event_stats_sync, date_from, date_to)
+
+
+async def get_intake_stats(date_from: str = None, date_to: str = None) -> dict:
+    """Get intake record statistics."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(executor, _get_intake_stats_sync, date_from, date_to)
 
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     """Main dashboard page."""
+
+    # ── Date filter ──────────────────────────────────────────────
+    preset = request.query_params.get("preset", "")
+    date_from = request.query_params.get("date_from", "")
+    date_to = request.query_params.get("date_to", "")
+
+    now_utc = datetime.now(timezone.utc)
+    if preset == "today":
+        date_from = now_utc.strftime("%Y-%m-%dT00:00:00")
+        date_to = ""
+    elif preset == "7d":
+        date_from = (now_utc - timedelta(days=7)).strftime("%Y-%m-%dT00:00:00")
+        date_to = ""
+    elif preset == "30d":
+        date_from = (now_utc - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00")
+        date_to = ""
+    elif preset == "all":
+        date_from = ""
+        date_to = ""
+    # For "custom" preset, date_from / date_to come from query params as-is.
+    # Append time component if pure date provided (YYYY-MM-DD).
+    if date_from and len(date_from) == 10:
+        date_from += "T00:00:00"
+    if date_to and len(date_to) == 10:
+        date_to += "T23:59:59"
     
     # Fetch emails from Cosmos DB
     emails = await get_emails_from_cosmos(limit=20)
     
-    # Fetch PE event stats
-    pe_stats = await get_pe_event_stats()
+    # Compute attachment security stats
+    total_rejected = sum(len(e.get("rejectedAttachments") or []) for e in emails)
+    total_link_rejected = sum(
+        len([f for f in ((e.get("linkDownload") or {}).get("failures") or [])
+             if f.get("error_type") == "content_type_not_allowed"])
+        for e in emails
+    )
+
+    # Fetch PE event stats + intake stats (with date filter)
+    pe_stats = await get_pe_event_stats(date_from or None, date_to or None)
+    intake_stats = await get_intake_stats(date_from or None, date_to or None)
     
     # Fetch messages from all queues (sequentially to avoid auth conflicts)
     queue_messages = {}
@@ -460,14 +573,20 @@ async def dashboard(request: Request):
             queue_messages[queue_name] = []
     
     return templates.TemplateResponse(
-        "dashboard.html",
-        {
-            "request": request,
+        request=request,
+        name="dashboard.html",
+        context={
             "emails": emails,
             "pe_stats": pe_stats,
+            "intake_stats": intake_stats,
             "queue_messages": queue_messages,
             "queue_names": QUEUE_NAMES,
             "pipeline_mode": os.environ.get("PIPELINE_MODE", "full"),
+            "rejected_attachments_count": total_rejected,
+            "rejected_links_count": total_link_rejected,
+            "filter_preset": preset or ("custom" if (date_from or date_to) else "all"),
+            "filter_date_from": date_from[:10] if date_from else "",
+            "filter_date_to": date_to[:10] if date_to else "",
         }
     )
 

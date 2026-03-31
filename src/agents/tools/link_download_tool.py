@@ -6,6 +6,8 @@ Module: src/agents/tools/link_download_tool.py
 Feature: 001-download-link-intake (US1)
 """
 
+import base64
+import hashlib
 import logging
 import os
 import re
@@ -23,6 +25,13 @@ from azure.identity.aio import DefaultAzureCredential
 from azure.storage.blob.aio import BlobServiceClient
 from azure.storage.blob import ContentSettings
 
+from .allowed_content_types import (
+    is_allowed_content_type,
+    is_allowed_extension,
+    ALLOWED_CONTENT_TYPES,
+    ALLOWED_EXTENSIONS,
+)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -36,6 +45,7 @@ class DownloadedFile:
     source: str          # Always "link"
     url: str             # Original source URL
     content_type: str    # MIME type from download response
+    content_md5: str | None = None  # Base64-encoded MD5 of file content
 
 
 @dataclass
@@ -61,9 +71,18 @@ class LinkDownloadResult:
 # URL / HTML parsing helpers
 # ---------------------------------------------------------------------------
 
-# Document extension filter (research.md §1)
+# Document extension filter — broad set of document-like extensions.
+# URLs matching these extensions are candidates for download; the actual
+# security enforcement (PDF-only policy) happens AFTER the HTTP response
+# is received via the content-type gate.  This pre-filter must be BROAD
+# so that non-allowed document types are still attempted, rejected, and
+# logged as failures (rather than silently ignored).
+_DOCUMENT_EXTENSIONS = {
+    "pdf", "csv", "xlsx", "xls", "docx", "doc", "pptx", "ppt",
+    "txt", "rtf", "odt", "ods", "odp", "tsv", "json", "xml",
+}
 DOCUMENT_EXTENSION_RE = re.compile(
-    r"\.(pdf|docx?|xlsx?|csv|pptx?|txt|zip)(\?.*)?$",
+    r"\.(" + "|".join(re.escape(ext) for ext in sorted(_DOCUMENT_EXTENSIONS)) + r")(\?.*)?$",
     re.IGNORECASE,
 )
 
@@ -169,6 +188,7 @@ class LinkDownloadTool:
         container_name: str = "attachments",
         max_file_size_bytes: int | None = None,
         download_timeout_seconds: int | None = None,
+        cosmos_tools=None,
     ) -> None:
         self.storage_account_url = (
             storage_account_url
@@ -181,6 +201,7 @@ class LinkDownloadTool:
             )
 
         self.container_name = container_name
+        self.cosmos_tools = cosmos_tools
 
         max_mb = int(os.environ.get("LINK_DOWNLOAD_MAX_SIZE_MB", "50"))
         self.max_file_size_bytes = max_file_size_bytes or (max_mb * 1024 * 1024)
@@ -192,12 +213,14 @@ class LinkDownloadTool:
         self,
         email_id: str,
         email_body: str,
+        partition_key: str | None = None,
     ) -> LinkDownloadResult:
         """Scan email body for document download links, download, and upload to blob.
 
         Args:
             email_id: Graph API message ID (used as blob path prefix).
             email_body: Raw email body text (HTML or plain text).
+            partition_key: Cosmos DB partition key for delivery tracking dedup.
 
         Returns:
             LinkDownloadResult with downloaded files and failures.
@@ -243,6 +266,64 @@ class LinkDownloadTool:
             f"{len(result.downloaded_files)} downloaded, "
             f"{len(result.failures)} failed"
         )
+
+        # Delivery tracking dedup (T014/T015): check each downloaded file
+        # against existing records in the same partition.
+        if self.cosmos_tools and partition_key:
+            for downloaded in result.downloaded_files:
+                if not downloaded.content_md5:
+                    continue
+                try:
+                    existing = self.cosmos_tools.find_by_content_hash(
+                        downloaded.content_md5, partition_key
+                    )
+                    if existing:
+                        self.cosmos_tools.increment_delivery_count(
+                            existing, downloaded.content_md5, action="duplicate"
+                        )
+                        logger.info(
+                            "Link download dedup: duplicate detected",
+                            extra={
+                                "email_id": email_id,
+                                "content_hash": downloaded.content_md5,
+                                "matched_record_id": existing.get("id", "")[:20],
+                                "action": "duplicate",
+                            },
+                        )
+                    else:
+                        # T020: Filename-match content update detection
+                        filename = downloaded.path.split("/")[-1] if "/" in downloaded.path else downloaded.path
+                        filename_match = self.cosmos_tools.find_by_filename(
+                            filename, partition_key
+                        )
+                        if filename_match and filename_match.get("contentHash") != downloaded.content_md5:
+                            self.cosmos_tools.increment_delivery_count(
+                                filename_match, downloaded.content_md5, action="update"
+                            )
+                            logger.info(
+                                "Link download dedup: content update detected",
+                                extra={
+                                    "email_id": email_id,
+                                    "content_hash": downloaded.content_md5,
+                                    "matched_record_id": filename_match.get("id", "")[:20],
+                                    "action": "update",
+                                },
+                            )
+                        else:
+                            logger.info(
+                                "Link download dedup: new content",
+                                extra={
+                                    "email_id": email_id,
+                                    "content_hash": downloaded.content_md5,
+                                    "action": "new",
+                                },
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        f"Link download dedup check failed: {exc}",
+                        extra={"email_id": email_id, "url": downloaded.url},
+                    )
+
         return result
 
     async def _download_and_upload(
@@ -298,6 +379,24 @@ class LinkDownloadTool:
                     )
                     return None
 
+                # Allowed content-type enforcement (security policy)
+                # Derive filename early so we can check extension as fallback
+                filename_check = _derive_filename(url, response)
+                if not is_allowed_content_type(content_type) and not is_allowed_extension(filename_check):
+                    allowed_str = ", ".join(sorted(ALLOWED_CONTENT_TYPES))
+                    failure = DownloadFailure(
+                        url=url,
+                        error=f"Content type '{content_type}' not in allowed list ({allowed_str})",
+                        attempted_at=datetime.now(timezone.utc).isoformat(),
+                        error_type="content_type_not_allowed",
+                    )
+                    result.failures.append(failure)
+                    logger.warning(
+                        "Download rejected: content type not in allowed list",
+                        extra={**log_ctx, "error_type": "content_type_not_allowed", "content_type": content_type},
+                    )
+                    return None
+
                 # Check Content-Length if available
                 content_length = response.content_length
                 if content_length and content_length > self.max_file_size_bytes:
@@ -340,6 +439,11 @@ class LinkDownloadTool:
 
                 file_data = b"".join(chunks)
 
+                # Compute content MD5 for delivery tracking
+                content_md5 = base64.b64encode(
+                    hashlib.md5(file_data).digest()
+                ).decode()
+
                 # Upload to blob storage
                 container_client = blob_service.get_container_client(self.container_name)
                 blob_client = container_client.get_blob_client(blob_path)
@@ -366,6 +470,7 @@ class LinkDownloadTool:
                     source="link",
                     url=url,
                     content_type=content_type,
+                    content_md5=content_md5,
                 )
 
         except asyncio.TimeoutError:

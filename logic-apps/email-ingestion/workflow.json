@@ -1,263 +1,676 @@
 {
-    "definition": {
-        "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-        "contentVersion": "1.0.0.0",
-        "triggers": {
-            "When_a_new_email_arrives_(V3)": {
-                "splitOn": "@triggerBody()?['value']",
-                "type": "ApiConnectionNotification",
-                "inputs": {
-                    "host": {
-                        "connection": {
-                            "name": "@parameters('$connections')['office365']['connectionId']"
-                        }
-                    },
-                    "fetch": {
-                        "pathTemplate": {
-                            "template": "/v3/Mail/OnNewEmail"
-                        },
-                        "method": "get",
-                        "queries": {
-                            "importance": "Any",
-                            "fetchOnlyWithAttachment": false,
-                            "includeAttachments": true,
-                            "folderPath": "Inbox"
-                        }
-                    },
-                    "subscribe": {
-                        "body": {
-                            "NotificationUrl": "@listCallbackUrl()"
-                        },
-                        "pathTemplate": {
-                            "template": "/GraphMailSubscriptionPoke/$subscriptions"
-                        },
-                        "method": "post",
-                        "queries": {
-                            "importance": "Any",
-                            "fetchOnlyWithAttachment": false,
-                            "folderPath": "Inbox"
-                        }
-                    }
-                },
-                "description": "Starts the flow when new emails arrive."
-            }
+  "definition": {
+    "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+    "contentVersion": "1.0.0.0",
+    "triggers": {
+      "Recurrence": {
+        "type": "Recurrence",
+        "recurrence": {
+          "frequency": "Minute",
+          "interval": 1,
+          "timeZone": "Romance Standard Time"
         },
+        "description": "Polls for new unread emails every minute via Microsoft Graph API."
+      }
+    },
+    "actions": {
+      "Initialize_variables": {
+        "runAfter": {},
+        "type": "InitializeVariable",
+        "inputs": {
+          "variables": [
+            {
+              "name": "AttachmentPaths",
+              "type": "array"
+            },
+            {
+              "name": "AttachmentsCount",
+              "type": "integer",
+              "value": 0
+            },
+            {
+              "name": "RejectedAttachments",
+              "type": "array"
+            }
+          ]
+        }
+      },
+      "HTTP_Get_Unread_Messages": {
+        "runAfter": {
+          "Initialize_variables": [
+            "Succeeded"
+          ]
+        },
+        "type": "Http",
+        "inputs": {
+          "method": "GET",
+          "uri": "https://graph.microsoft.com/v1.0/users/@{parameters('monitoredMailbox')}/messages",
+          "queries": {
+            "$filter": "isRead eq false",
+            "$top": "10",
+            "$expand": "attachments",
+            "$select": "id,from,subject,body,bodyPreview,receivedDateTime,hasAttachments",
+            "$orderby": "receivedDateTime asc"
+          },
+          "authentication": {
+            "type": "ActiveDirectoryOAuth",
+            "authority": "https://login.microsoftonline.com",
+            "tenant": "@parameters('graphTenantId')",
+            "audience": "https://graph.microsoft.com",
+            "clientId": "@parameters('graphClientId')",
+            "secret": "@parameters('graphClientSecret')"
+          }
+        },
+        "description": "Fetches up to 10 unread emails from the monitored mailbox using Microsoft Graph API with app-only (client credentials) authentication."
+      },
+      "For_each_message": {
+        "foreach": "@body('HTTP_Get_Unread_Messages')?['value']",
+        "runAfter": {
+          "HTTP_Get_Unread_Messages": [
+            "Succeeded"
+          ]
+        },
+        "type": "Foreach",
+        "runtimeConfiguration": {
+          "concurrency": {
+            "repetitions": 1
+          }
+        },
+        "description": "Processes each unread message sequentially. Variables are reset at the start of each iteration.",
         "actions": {
-            "Initialize_variables": {
-                "runAfter": {},
-                "type": "InitializeVariable",
-                "inputs": {
-                    "variables": [
-                        {
-                            "name": "AttachmentPaths",
-                            "type": "array"
-                        },
-                        {
-                            "name": "AttachmentsCount",
-                            "type": "integer",
-                            "value": 0
-                        }
-                    ]
-                }
+          "Reset_AttachmentPaths": {
+            "runAfter": {},
+            "type": "SetVariable",
+            "inputs": {
+              "name": "AttachmentPaths",
+              "value": []
+            }
+          },
+          "Reset_AttachmentsCount": {
+            "runAfter": {
+              "Reset_AttachmentPaths": [
+                "Succeeded"
+              ]
             },
-            "For_each_attachment": {
-                "foreach": "@triggerBody()?['attachments']",
+            "type": "SetVariable",
+            "inputs": {
+              "name": "AttachmentsCount",
+              "value": 0
+            }
+          },
+          "Reset_RejectedAttachments": {
+            "runAfter": {
+              "Reset_AttachmentsCount": [
+                "Succeeded"
+              ]
+            },
+            "type": "SetVariable",
+            "inputs": {
+              "name": "RejectedAttachments",
+              "value": []
+            }
+          },
+          "For_each_attachment": {
+            "foreach": "@items('For_each_message')?['attachments']",
+            "actions": {
+              "Check_if_not_inline": {
                 "actions": {
-                    "Check_if_not_inline": {
-                        "actions": {
-                            "Create_blob_(V2)": {
-                                "type": "ApiConnection",
-                                "inputs": {
-                                    "host": {
-                                        "connection": {
-                                            "name": "@parameters('$connections')['azureblob']['connectionId']"
-                                        }
-                                    },
-                                    "method": "post",
-                                    "body": "@base64ToBinary(item()?['contentBytes'])",
-                                    "headers": {
-                                        "ReadFileMetadataFromServer": true
-                                    },
-                                    "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent('stdocprocdevizr2ch55'))}/files",
-                                    "queries": {
-                                        "folderPath": "/attachments",
-                                        "name": "@{triggerOutputs()?['body/id']}/@{item()?['name']}",
-                                        "queryParametersSingleEncoded": true
-                                    }
-                                },
-                                "runtimeConfiguration": {
-                                    "contentTransfer": {
-                                        "transferMode": "Chunked"
-                                    }
-                                }
-                            },
-                            "Append_to_AttachmentPaths": {
-                                "runAfter": {
-                                    "Create_blob_(V2)": [
-                                        "Succeeded"
-                                    ]
-                                },
-                                "type": "AppendToArrayVariable",
-                                "inputs": {
-                                    "name": "AttachmentPaths",
-                                    "value": {
-                                        "path": "@{triggerOutputs()?['body/id']}/@{item()?['name']}",
-                                        "source": "attachment"
-                                    }
-                                }
-                            },
-                            "Increment_AttachmentsCount": {
-                                "runAfter": {
-                                    "Append_to_AttachmentPaths": [
-                                        "Succeeded"
-                                    ]
-                                },
-                                "type": "IncrementVariable",
-                                "inputs": {
-                                    "name": "AttachmentsCount",
-                                    "value": 1
-                                }
+                  "Check_if_allowed_type": {
+                    "actions": {
+                      "Create_blob_(V2)": {
+                        "type": "ApiConnection",
+                        "inputs": {
+                          "host": {
+                            "connection": {
+                              "name": "@parameters('$connections')['azureblob']['connectionId']"
                             }
+                          },
+                          "method": "post",
+                          "body": "@base64ToBinary(items('For_each_attachment')?['contentBytes'])",
+                          "headers": {
+                            "ReadFileMetadataFromServer": true
+                          },
+                          "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent('stdocprocdevizr2ch55'))}/files",
+                          "queries": {
+                            "folderPath": "/attachments",
+                            "name": "@{items('For_each_message')?['id']}/@{items('For_each_attachment')?['name']}",
+                            "queryParametersSingleEncoded": true
+                          }
                         },
-                        "else": {
-                            "actions": {}
+                        "runtimeConfiguration": {
+                          "contentTransfer": {
+                            "transferMode": "Chunked"
+                          }
+                        }
+                      },
+                      "Get_attachment_md5": {
+                        "runAfter": {
+                          "Create_blob_(V2)": [
+                            "Succeeded"
+                          ]
                         },
-                        "expression": {
-                            "and": [
-                                {
-                                    "equals": [
-                                        "@item()['isInline']",
-                                        "@false"
-                                    ]
-                                }
-                            ]
+                        "type": "Http",
+                        "inputs": {
+                          "method": "HEAD",
+                          "uri": "https://stdocprocdevizr2ch55.blob.core.windows.net/attachments/@{items('For_each_message')?['id']}/@{uriComponent(items('For_each_attachment')?['name'])}",
+                          "headers": {
+                            "x-ms-version": "2020-10-02"
+                          },
+                          "authentication": {
+                            "type": "ManagedServiceIdentity",
+                            "audience": "https://storage.azure.com/"
+                          }
                         },
-                        "type": "If"
-                    }
+                        "description": "GET Content-MD5 header from uploaded blob for delivery tracking."
+                      },
+                      "Append_to_AttachmentPaths": {
+                        "runAfter": {
+                          "Get_attachment_md5": [
+                            "Succeeded"
+                          ]
+                        },
+                        "type": "AppendToArrayVariable",
+                        "inputs": {
+                          "name": "AttachmentPaths",
+                          "value": {
+                            "path": "@{items('For_each_message')?['id']}/@{items('For_each_attachment')?['name']}",
+                            "source": "attachment",
+                            "contentMd5": "@{outputs('Get_attachment_md5')['headers']['Content-MD5']}",
+                            "originalName": "@{items('For_each_attachment')?['name']}"
+                          }
+                        }
+                      },
+                      "Increment_AttachmentsCount": {
+                        "runAfter": {
+                          "Append_to_AttachmentPaths": [
+                            "Succeeded"
+                          ]
+                        },
+                        "type": "IncrementVariable",
+                        "inputs": {
+                          "name": "AttachmentsCount",
+                          "value": 1
+                        }
+                      }
+                    },
+                    "else": {
+                      "actions": {
+                        "Append_rejected_attachment": {
+                          "type": "AppendToArrayVariable",
+                          "inputs": {
+                            "name": "RejectedAttachments",
+                            "value": {
+                              "name": "@{items('For_each_attachment')?['name']}",
+                              "contentType": "@{items('For_each_attachment')?['contentType']}",
+                              "size": "@{items('For_each_attachment')?['size']}",
+                              "reason": "Content type not in allowed list (PDF only)"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "expression": {
+                      "or": [
+                        {
+                          "equals": [
+                            "@items('For_each_attachment')['contentType']",
+                            "application/pdf"
+                          ]
+                        },
+                        {
+                          "endsWith": [
+                            "@toLower(items('For_each_attachment')['name'])",
+                            ".pdf"
+                          ]
+                        }
+                      ]
+                    },
+                    "type": "If",
+                    "description": "Only process PDF attachments. To extend: add more content types to the 'or' array. See src/agents/tools/allowed_content_types.py for the shared configuration."
+                  }
                 },
-                "runAfter": {
-                    "Initialize_variables": [
-                        "Succeeded"
-                    ]
+                "else": {
+                  "actions": {}
                 },
-                "type": "Foreach",
-                "runtimeConfiguration": {
-                    "concurrency": {
-                        "repetitions": 20
+                "expression": {
+                  "and": [
+                    {
+                      "equals": [
+                        "@items('For_each_attachment')['isInline']",
+                        "@false"
+                      ]
                     }
+                  ]
+                },
+                "type": "If"
+              }
+            },
+            "runAfter": {
+              "Reset_RejectedAttachments": [
+                "Succeeded"
+              ]
+            },
+            "type": "Foreach",
+            "runtimeConfiguration": {
+              "concurrency": {
+                "repetitions": 20
+              }
+            }
+          },
+          "Compute_primary_hash": {
+            "runAfter": {
+              "For_each_attachment": [
+                "Succeeded"
+              ]
+            },
+            "type": "Compose",
+            "inputs": "@if(greater(length(variables('AttachmentPaths')), 0), first(variables('AttachmentPaths'))['contentMd5'], null)",
+            "description": "Extract primary content hash from the first processed attachment for delivery tracking."
+          },
+          "Check_content_hash_dedup": {
+            "runAfter": {
+              "Compute_primary_hash": [
+                "Succeeded"
+              ],
+              "Compute_primary_attachment_name": [
+                "Succeeded"
+              ]
+            },
+            "type": "ApiConnection",
+            "inputs": {
+              "host": {
+                "connection": {
+                  "name": "@parameters('$connections')['documentdb']['connectionId']"
                 }
+              },
+              "method": "get",
+              "path": "/v5/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('intake-records')}/query",
+              "queries": {
+                "queryText": "SELECT TOP 1 * FROM c WHERE c.contentHash = '@{coalesce(outputs('Compute_primary_hash'), '__NO_HASH__')}'",
+                "partitionKey": "\"@{concat(replace(last(split(items('For_each_message')?['from']?['emailAddress']?['address'], '@')), '>', ''), '_', formatDateTime(items('For_each_message')?['receivedDateTime'], 'yyyy-MM'))}\"",
+                "maxItemCount": 1
+              }
             },
-            "Create_or_update_email_document": {
-                "runAfter": {
-                    "For_each_attachment": [
-                        "Succeeded"
-                    ]
-                },
+            "description": "Query for existing record with matching contentHash in the same partition for dedup."
+          },
+          "Handle_email_dedup": {
+            "runAfter": {
+              "Check_content_hash_dedup": [
+                "Succeeded"
+              ]
+            },
+            "type": "If",
+            "expression": {
+              "and": [
+                {
+                  "greater": [
+                    "@length(body('Check_content_hash_dedup')?['value'])",
+                    0
+                  ]
+                }
+              ]
+            },
+            "actions": {
+              "Patch_email_delivery_count": {
                 "type": "ApiConnection",
                 "inputs": {
-                    "host": {
-                        "connection": {
-                            "name": "@parameters('$connections')['documentdb']['connectionId']"
-                        }
-                    },
-                    "method": "post",
-                    "body": {
-                        "id": "@{triggerBody()?['id']}",
-                        "intakeSource": "email",
-                        "partitionKey": "@{concat(replace(last(split(triggerBody()?['from'], '@')), '>', ''), '_', formatDateTime(triggerBody()?['receivedDateTime'], 'yyyy-MM'))}",
-                        "status": "received",
-                        "confidenceLevel": "pending",
-                        "receivedAt": "@{triggerBody()?['receivedDateTime']}",
-                        "from": "@{triggerBody()?['from']}",
-                        "subject": "@{triggerBody()?['subject']}",
-                        "hasAttachments": "@greater(variables('AttachmentsCount'), 0)",
-                        "attachmentsCount": "@variables('AttachmentsCount')",
-                        "emailBody": "@{triggerBody()?['body']}",
-                        "attachmentPaths": "@variables('AttachmentPaths')",
-                        "processedAt": null,
-                        "classification": null,
-                        "archivalPath": null
-                    },
-                    "headers": {
-                        "x-ms-documentdb-is-upsert": true
-                    },
-                    "path": "/v2/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('intake-records')}/docs"
-                },
-                "description": "Creates/updates email document in Cosmos DB with attachment count (after processing attachments)"
-            },
-            "Send_message_to_Service_Bus": {
-                "runAfter": {
-                    "Create_or_update_email_document": [
-                        "Succeeded"
-                    ]
-                },
-                "type": "ApiConnection",
-                "inputs": {
-                    "host": {
-                        "connection": {
-                            "name": "@parameters('$connections')['servicebus']['connectionId']"
-                        }
-                    },
-                    "method": "post",
-                    "body": {
-                        "ContentData": "@base64(concat('{','\n','  \"emailId\": \"',triggerOutputs()?['body/id'],'\",','\n','  \"from\": \"',triggerOutputs()?['body/from'],'\",','\n','  \"subject\": \"',triggerOutputs()?['body/subject'],'\",','\n','  \"bodyText\": \"',triggerOutputs()?['body/bodyPreview'],'\", ','\n','  \"receivedAt\": \"',triggerOutputs()?['body/receivedDateTime'],'\",','\n','  \"attachmentsCount\":',variables('AttachmentsCount'),' ,','\n','  \"hasAttachments\": ',greater(variables('AttachmentsCount'),0),',','\n','  \"attachmentPaths\": ',variables('AttachmentPaths'),',','\n','  \"priority\": \"normal\",','\n','  \"source\": \"logic-app-ingestion\"','\n','}'))"
-                    },
-                    "path": "/@{encodeURIComponent(encodeURIComponent('intake'))}/messages",
-                    "queries": {
-                        "systemProperties": "None"
+                  "host": {
+                    "connection": {
+                      "name": "@parameters('$connections')['documentdb']['connectionId']"
                     }
+                  },
+                  "method": "patch",
+                  "path": "/v2/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('intake-records')}/docs/@{encodeURIComponent(first(body('Check_content_hash_dedup')?['value'])?['id'])}",
+                  "headers": {
+                    "Content-Type": "application/json_patch+json",
+                    "x-ms-documentdb-partitionkey": "[\"@{first(body('Check_content_hash_dedup')?['value'])?['partitionKey']}\"]",
+                    "x-ms-version": "2022-11-15"
+                  },
+                  "body": {
+                    "operations": [
+                      {
+                        "op": "incr",
+                        "path": "/deliveryCount",
+                        "value": 1
+                      },
+                      {
+                        "op": "add",
+                        "path": "/deliveryHistory/-",
+                        "value": {
+                          "deliveredAt": "@{utcNow()}",
+                          "contentHash": "@{outputs('Compute_primary_hash')}",
+                          "action": "duplicate"
+                        }
+                      },
+                      {
+                        "op": "set",
+                        "path": "/lastDeliveredAt",
+                        "value": "@{utcNow()}"
+                      }
+                    ]
+                  }
+                },
+                "description": "Duplicate: increment deliveryCount, append delivery history on existing record via Cosmos DB partial update."
+              }
+            },
+            "else": {
+              "actions": {
+                "Check_filename_match": {
+                  "type": "ApiConnection",
+                  "inputs": {
+                    "host": {
+                      "connection": {
+                        "name": "@parameters('$connections')['documentdb']['connectionId']"
+                      }
+                    },
+                    "method": "get",
+                    "path": "/v5/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('intake-records')}/query",
+                    "queries": {
+                      "queryText": "@{concat('SELECT TOP 1 * FROM c WHERE ARRAY_CONTAINS(c.attachmentPaths, {\"originalName\": \"', coalesce(outputs('Compute_primary_attachment_name'), '__NO_NAME__'), '\"}, true)')}",
+                      "partitionKey": "\"@{concat(replace(last(split(items('For_each_message')?['from']?['emailAddress']?['address'], '@')), '>', ''), '_', formatDateTime(items('For_each_message')?['receivedDateTime'], 'yyyy-MM'))}\"",
+                      "maxItemCount": 1
+                    }
+                  },
+                  "description": "US4: Query for existing record with matching filename in the same partition when no hash match found."
+                },
+                "Handle_filename_match": {
+                  "runAfter": {
+                    "Check_filename_match": [
+                      "Succeeded"
+                    ]
+                  },
+                  "type": "If",
+                  "expression": {
+                    "and": [
+                      {
+                        "greater": [
+                          "@length(body('Check_filename_match')?['value'])",
+                          0
+                        ]
+                      }
+                    ]
+                  },
+                  "actions": {
+                    "Patch_email_content_update": {
+                      "type": "ApiConnection",
+                      "inputs": {
+                        "host": {
+                          "connection": {
+                            "name": "@parameters('$connections')['documentdb']['connectionId']"
+                          }
+                        },
+                        "method": "patch",
+                        "path": "/v2/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('intake-records')}/docs/@{encodeURIComponent(first(body('Check_filename_match')?['value'])?['id'])}",
+                        "headers": {
+                          "Content-Type": "application/json_patch+json",
+                          "x-ms-documentdb-partitionkey": "[\"@{first(body('Check_filename_match')?['value'])?['partitionKey']}\"]",
+                          "x-ms-version": "2022-11-15"
+                        },
+                        "body": {
+                          "operations": [
+                            {
+                              "op": "set",
+                              "path": "/contentHash",
+                              "value": "@{outputs('Compute_primary_hash')}"
+                            },
+                            {
+                              "op": "incr",
+                              "path": "/version",
+                              "value": 1
+                            },
+                            {
+                              "op": "incr",
+                              "path": "/deliveryCount",
+                              "value": 1
+                            },
+                            {
+                              "op": "add",
+                              "path": "/deliveryHistory/-",
+                              "value": {
+                                "deliveredAt": "@{utcNow()}",
+                                "contentHash": "@{outputs('Compute_primary_hash')}",
+                                "action": "update"
+                              }
+                            },
+                            {
+                              "op": "set",
+                              "path": "/lastDeliveredAt",
+                              "value": "@{utcNow()}"
+                            }
+                          ]
+                        }
+                      },
+                      "description": "US4 content update: same filename, different hash \u2014 increment version, update contentHash, append delivery history."
+                    }
+                  },
+                  "else": {
+                    "actions": {
+                      "Create_or_update_email_document": {
+                        "type": "ApiConnection",
+                        "inputs": {
+                          "host": {
+                            "connection": {
+                              "name": "@parameters('$connections')['documentdb']['connectionId']"
+                            }
+                          },
+                          "method": "post",
+                          "body": {
+                            "id": "@{items('For_each_message')?['id']}",
+                            "intakeSource": "email",
+                            "partitionKey": "@{concat(replace(last(split(items('For_each_message')?['from']?['emailAddress']?['address'], '@')), '>', ''), '_', formatDateTime(items('For_each_message')?['receivedDateTime'], 'yyyy-MM'))}",
+                            "status": "received",
+                            "confidenceLevel": "pending",
+                            "receivedAt": "@{items('For_each_message')?['receivedDateTime']}",
+                            "from": "@{items('For_each_message')?['from']?['emailAddress']?['address']}",
+                            "subject": "@{items('For_each_message')?['subject']}",
+                            "hasAttachments": "@greater(variables('AttachmentsCount'), 0)",
+                            "attachmentsCount": "@variables('AttachmentsCount')",
+                            "emailBody": "@{items('For_each_message')?['body']?['content']}",
+                            "attachmentPaths": "@variables('AttachmentPaths')",
+                            "rejectedAttachments": "@variables('RejectedAttachments')",
+                            "contentHash": "@{outputs('Compute_primary_hash')}",
+                            "version": 1,
+                            "deliveryCount": 1,
+                            "deliveryHistory": [
+                              {
+                                "deliveredAt": "@{utcNow()}",
+                                "contentHash": "@{outputs('Compute_primary_hash')}",
+                                "action": "new"
+                              }
+                            ],
+                            "lastDeliveredAt": "@{utcNow()}",
+                            "processedAt": null,
+                            "classification": null,
+                            "archivalPath": null
+                          },
+                          "headers": {
+                            "x-ms-documentdb-is-upsert": true
+                          },
+                          "path": "/v2/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('intake-records')}/docs"
+                        },
+                        "description": "New record: creates email document in Cosmos DB with delivery tracking fields."
+                      }
+                    }
+                  },
+                  "description": "US4: If filename match found (different hash) -> content update; else -> new record."
+                }
+              }
+            },
+            "description": "3-way dedup routing: hash match \u2192 duplicate patch; no hash match \u2192 filename match check \u2192 content update patch or new record creation."
+          },
+          "Send_if_not_duplicate": {
+            "runAfter": {
+              "Handle_email_dedup": [
+                "Succeeded"
+              ]
+            },
+            "type": "If",
+            "expression": {
+              "and": [
+                {
+                  "equals": [
+                    "@length(body('Check_content_hash_dedup')?['value'])",
+                    0
+                  ]
+                }
+              ]
+            },
+            "actions": {
+              "Compose_SB_Message": {
+                "runAfter": {},
+                "type": "Compose",
+                "inputs": {
+                  "emailId": "@{items('For_each_message')?['id']}",
+                  "from": "@{items('For_each_message')?['from']?['emailAddress']?['address']}",
+                  "subject": "@{items('For_each_message')?['subject']}",
+                  "bodyText": "@{items('For_each_message')?['bodyPreview']}",
+                  "receivedAt": "@{items('For_each_message')?['receivedDateTime']}",
+                  "attachmentsCount": "@variables('AttachmentsCount')",
+                  "hasAttachments": "@greater(variables('AttachmentsCount'),0)",
+                  "attachmentPaths": "@variables('AttachmentPaths')",
+                  "rejectedAttachmentsCount": "@length(variables('RejectedAttachments'))",
+                  "priority": "normal",
+                  "source": "logic-app-ingestion"
+                },
+                "description": "Build Service Bus message payload as a proper JSON object. Logic Apps handles serialization and escaping of special characters (quotes, accents, etc.) automatically."
+              },
+              "Send_message_to_Service_Bus": {
+                "runAfter": {
+                  "Compose_SB_Message": [
+                    "Succeeded"
+                  ]
+                },
+                "type": "ApiConnection",
+                "inputs": {
+                  "host": {
+                    "connection": {
+                      "name": "@parameters('$connections')['servicebus']['connectionId']"
+                    }
+                  },
+                  "method": "post",
+                  "body": {
+                    "ContentData": "@{base64(string(outputs('Compose_SB_Message')))}"
+                  },
+                  "path": "/@{encodeURIComponent(encodeURIComponent('intake'))}/messages",
+                  "queries": {
+                    "systemProperties": "None"
+                  }
                 },
                 "description": "Sends email metadata to Service Bus for agent processing"
-            }
-        },
-        "outputs": {},
-        "parameters": {
-            "$connections": {
-                "type": "Object",
-                "defaultValue": {}
-            }
+              }
+            },
+            "else": {
+              "actions": {}
+            },
+            "description": "Only send to intake queue for new records and content updates (filename match with different hash). Skip for exact hash-match duplicates to avoid redundant triage processing."
+          },
+          "HTTP_Mark_As_Read": {
+            "runAfter": {
+              "Send_if_not_duplicate": [
+                "Succeeded"
+              ]
+            },
+            "type": "Http",
+            "inputs": {
+              "method": "PATCH",
+              "uri": "https://graph.microsoft.com/v1.0/users/@{parameters('monitoredMailbox')}/messages/@{items('For_each_message')?['id']}",
+              "body": {
+                "isRead": true
+              },
+              "authentication": {
+                "type": "ActiveDirectoryOAuth",
+                "authority": "https://login.microsoftonline.com",
+                "tenant": "@parameters('graphTenantId')",
+                "audience": "https://graph.microsoft.com",
+                "clientId": "@parameters('graphClientId')",
+                "secret": "@parameters('graphClientSecret')"
+              }
+            },
+            "description": "Marks the email as read to prevent reprocessing on next poll."
+          },
+          "Compute_primary_attachment_name": {
+            "runAfter": {
+              "For_each_attachment": [
+                "Succeeded"
+              ]
+            },
+            "type": "Compose",
+            "inputs": "@if(greater(length(variables('AttachmentPaths')), 0), first(variables('AttachmentPaths'))['originalName'], null)",
+            "description": "Extract primary attachment filename for filename-match dedup in US4."
+          }
         }
+      }
     },
+    "outputs": {},
     "parameters": {
-        "$connections": {
-            "value": {
-                "office365": {
-                    "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/office365",
-                    "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/office365",
-                    "connectionName": "office365",
-                    "connectionProperties": {}
-                },
-                "documentdb": {
-                    "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/documentdb",
-                    "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/documentdb",
-                    "connectionName": "documentdb",
-                    "connectionProperties": {
-                        "authentication": {
-                            "type": "ManagedServiceIdentity"
-                        }
-                    }
-                },
-                "azureblob": {
-                    "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/azureblob",
-                    "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/azureblob",
-                    "connectionName": "azureblob",
-                    "connectionProperties": {
-                        "authentication": {
-                            "type": "ManagedServiceIdentity"
-                        }
-                    }
-                },
-                "servicebus": {
-                    "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/servicebus",
-                    "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/servicebus",
-                    "connectionName": "servicebus",
-                    "connectionProperties": {
-                        "authentication": {
-                            "type": "ManagedServiceIdentity"
-                        }
-                    }
-                }
-            }
-        }
+      "$connections": {
+        "type": "Object",
+        "defaultValue": {}
+      },
+      "monitoredMailbox": {
+        "type": "String",
+        "defaultValue": ""
+      },
+      "graphTenantId": {
+        "type": "String",
+        "defaultValue": ""
+      },
+      "graphClientId": {
+        "type": "String",
+        "defaultValue": ""
+      },
+      "graphClientSecret": {
+        "type": "SecureString",
+        "defaultValue": ""
+      }
     }
+  },
+  "parameters": {
+    "$connections": {
+      "value": {
+        "documentdb": {
+          "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/documentdb",
+          "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/documentdb",
+          "connectionName": "documentdb",
+          "connectionProperties": {
+            "authentication": {
+              "type": "ManagedServiceIdentity"
+            }
+          }
+        },
+        "azureblob": {
+          "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/azureblob",
+          "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/azureblob",
+          "connectionName": "azureblob",
+          "connectionProperties": {
+            "authentication": {
+              "type": "ManagedServiceIdentity"
+            }
+          }
+        },
+        "servicebus": {
+          "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/servicebus",
+          "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/servicebus",
+          "connectionName": "servicebus",
+          "connectionProperties": {
+            "authentication": {
+              "type": "ManagedServiceIdentity"
+            }
+          }
+        }
+      }
+    },
+    "monitoredMailbox": {
+      "value": "admin@M365x66851375.onmicrosoft.com"
+    },
+    "graphTenantId": {
+      "value": "2ce91bb1-0177-45b5-a98c-9c2f7ebe64de"
+    },
+    "graphClientId": {
+      "value": "93350d2a-45d4-4bb0-bd21-5438c2f6cc7f"
+    },
+    "graphClientSecret": {
+      "value": ""
+    }
+  }
 }

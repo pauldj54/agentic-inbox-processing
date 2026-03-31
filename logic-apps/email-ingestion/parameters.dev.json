@@ -16,12 +16,6 @@
         },
         "$connections": {
             "value": {
-                "office365": {
-                    "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/office365",
-                    "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/office365",
-                    "connectionName": "office365",
-                    "connectionProperties": {}
-                },
                 "documentdb": {
                     "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/documentdb",
                     "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/documentdb",
@@ -53,6 +47,24 @@
                     }
                 }
             }
+        },
+        "monitoredMailbox": {
+            "value": "admin@M365x66851375.onmicrosoft.com"
+        },
+        "graphTenantId": {
+            "value": "2ce91bb1-0177-45b5-a98c-9c2f7ebe64de"
+        },
+        "graphClientId": {
+            "value": "93350d2a-45d4-4bb0-bd21-5438c2f6cc7f"
+        },
+        "graphClientSecret": {
+            "value": "(injected by deploy script from Key Vault)"
+        },
+        "pollingFrequency": {
+            "value": "Minute"
+        },
+        "pollingInterval": {
+            "value": 1
         }
     }
 }

@@ -2,7 +2,17 @@
 # Deploy all resources
 # Resources: Logic Apps (email + SFTP) + Web App (Python code)
 # Resource Group: rg-docproc-dev
+#
+# Usage:
+#   .\deploy_updates.ps1                   # defaults to -Environment dev
+#   .\deploy_updates.ps1 -Environment prod
 # ============================================================================
+param(
+    [ValidateSet("dev", "prod")]
+    [string]$Environment = "dev"
+)
+
+Write-Host "Deploying with environment: $Environment" -ForegroundColor Cyan
 
 $resourceGroup    = "rg-docproc-dev"
 $logicAppName     = "logic-docproc-dev-izr2ch55woa3c"
@@ -13,10 +23,68 @@ $keyVaultName     = "kv-docproc-dev-izr2ch55"
 # --- 1a. Deploy Email Logic App workflow ---
 Write-Host "`n=== Deploying Email Logic App workflow ===" -ForegroundColor Cyan
 
+# Fetch Graph API client secret from Key Vault (never stored in source control)
+Write-Host "Fetching Graph API client secret from Key Vault..." -ForegroundColor Gray
+$graphSecret = az keyvault secret show `
+  --vault-name $keyVaultName `
+  --name "graph-client-secret" `
+  --query "value" -o tsv
+
+if (-not $graphSecret) {
+    Write-Host "Failed to retrieve graph-client-secret from Key Vault!" -ForegroundColor Red
+    Write-Host "Ensure the secret exists in $keyVaultName and you have Key Vault Secrets User role." -ForegroundColor Yellow
+} else {
+    Write-Host "Graph secret retrieved successfully." -ForegroundColor Gray
+}
+
+# Read the workflow definition
+$emailWfJson = Get-Content -Raw "logic-apps/email-ingestion/workflow.json" | ConvertFrom-Json -AsHashtable
+
+# Merge environment-specific parameter values
+$emailEnvFile = "logic-apps/email-ingestion/parameters.$Environment.json"
+if (-not (Test-Path $emailEnvFile)) {
+    Write-Host "Parameter file not found: $emailEnvFile" -ForegroundColor Red
+    exit 1
+}
+Write-Host "Merging parameters from $emailEnvFile..." -ForegroundColor Gray
+$emailEnvParams = (Get-Content -Raw $emailEnvFile | ConvertFrom-Json -AsHashtable)['parameters']
+
+# Only merge parameters that are declared in the workflow definition
+$declaredParams = $emailWfJson['definition']['parameters'].Keys
+foreach ($key in $emailEnvParams.Keys) {
+    # pollingFrequency/pollingInterval are applied to the trigger, not as Logic App params
+    if ($key -in @('pollingFrequency', 'pollingInterval')) { continue }
+    if ($key -notin $declaredParams) {
+        Write-Host "  Skipping undeclared parameter: $key" -ForegroundColor Yellow
+        continue
+    }
+    $emailWfJson['parameters'][$key] = $emailEnvParams[$key]
+}
+
+# Inject the Graph client secret from Key Vault (overrides placeholder in env file)
+$emailWfJson['parameters']['graphClientSecret'] = @{ value = $graphSecret }
+
+# Apply polling schedule to the Recurrence trigger (these can't use @parameters() at runtime)
+if ($emailEnvParams.ContainsKey('pollingFrequency')) {
+    $emailWfJson['definition']['triggers']['Recurrence']['recurrence']['frequency'] = $emailEnvParams['pollingFrequency']['value']
+    Write-Host "  Polling frequency: $($emailEnvParams['pollingFrequency']['value'])" -ForegroundColor Gray
+}
+if ($emailEnvParams.ContainsKey('pollingInterval')) {
+    $emailWfJson['definition']['triggers']['Recurrence']['recurrence']['interval'] = $emailEnvParams['pollingInterval']['value']
+    Write-Host "  Polling interval:  $($emailEnvParams['pollingInterval']['value'])" -ForegroundColor Gray
+}
+
+# Write the full workflow (definition + parameters) to a temp file
+$emailFullPath = "$env:TEMP\email-la-full.json"
+$emailWfJson | ConvertTo-Json -Depth 50 | Set-Content -Path $emailFullPath -Encoding UTF8
+
 az logic workflow create `
   --resource-group $resourceGroup `
   --name $logicAppName `
-  --definition "@logic-apps/email-ingestion/workflow.json"
+  --definition "@$emailFullPath"
+
+# Clean up temp file
+Remove-Item $emailFullPath -ErrorAction SilentlyContinue
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Email Logic App deployed successfully." -ForegroundColor Green
@@ -41,10 +109,29 @@ if (-not $spSecret) {
     Write-Host "Secret retrieved successfully." -ForegroundColor Gray
 }
 
-# Read the full workflow JSON as a hashtable so we can mutate it
+# Read the workflow definition
 $wfJson = Get-Content -Raw "logic-apps/sftp-file-ingestion/workflow.json" | ConvertFrom-Json -AsHashtable
 
-# Inject the SharePoint client secret into the parameter values
+# Merge environment-specific parameter values
+$sftpEnvFile = "logic-apps/sftp-file-ingestion/parameters.$Environment.json"
+if (-not (Test-Path $sftpEnvFile)) {
+    Write-Host "Parameter file not found: $sftpEnvFile" -ForegroundColor Red
+    exit 1
+}
+Write-Host "Merging parameters from $sftpEnvFile..." -ForegroundColor Gray
+$sftpEnvParams = (Get-Content -Raw $sftpEnvFile | ConvertFrom-Json -AsHashtable)['parameters']
+
+# Only merge parameters that are declared in the workflow definition
+$sftpDeclaredParams = $wfJson['definition']['parameters'].Keys
+foreach ($key in $sftpEnvParams.Keys) {
+    if ($key -notin $sftpDeclaredParams) {
+        Write-Host "  Skipping undeclared parameter: $key" -ForegroundColor Yellow
+        continue
+    }
+    $wfJson['parameters'][$key] = $sftpEnvParams[$key]
+}
+
+# Inject the SharePoint client secret from Key Vault (overrides placeholder in env file)
 $wfJson['parameters']['sharepointClientSecret'] = @{ value = $spSecret }
 
 # Write the full workflow (definition + parameters) to a temp file

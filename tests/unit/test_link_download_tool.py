@@ -102,20 +102,27 @@ class TestIsDocumentUrl:
 
     @pytest.mark.parametrize("url", [
         "https://host.com/report.pdf",
+        "https://host.com/report.PDF",
+    ])
+    def test_allowed_extensions_accepted(self, url):
+        assert _is_document_url(url) is True
+
+    @pytest.mark.parametrize("url", [
         "https://host.com/data.xlsx",
         "https://host.com/doc.docx",
         "https://host.com/sheet.csv",
         "https://host.com/slides.pptx",
         "https://host.com/readme.txt",
-        "https://host.com/archive.zip",
         "https://host.com/old.doc",
         "https://host.com/old.xls",
         "https://host.com/old.ppt",
     ])
     def test_document_extensions_accepted(self, url):
+        """Document-type extensions pass the URL pre-filter (content-type gate enforces policy)."""
         assert _is_document_url(url) is True
 
     @pytest.mark.parametrize("url", [
+        "https://host.com/archive.zip",
         "https://host.com/page.html",
         "https://host.com/image.jpg",
         "https://host.com/image.png",
@@ -142,7 +149,9 @@ class TestIsDocumentUrl:
 
     def test_case_insensitive_extension(self):
         assert _is_document_url("https://host.com/FILE.PDF") is True
+        # Document extensions pass URL pre-filter regardless of case
         assert _is_document_url("https://host.com/file.Docx") is True
+        assert _is_document_url("https://host.com/file.CSV") is True
 
 
 # =====================================================================
@@ -401,6 +410,8 @@ class TestDocumentExtensionRegex:
     @pytest.mark.parametrize("path,expected", [
         ("/file.pdf", True),
         ("/file.PDF", True),
+        ("/file.pdf?v=1", True),
+        # Document extensions pass the broad URL pre-filter
         ("/file.docx", True),
         ("/file.doc", True),
         ("/file.xlsx", True),
@@ -409,8 +420,8 @@ class TestDocumentExtensionRegex:
         ("/file.pptx", True),
         ("/file.ppt", True),
         ("/file.txt", True),
-        ("/file.zip", True),
-        ("/file.pdf?v=1", True),
+        # Non-document types are still rejected by the URL pre-filter
+        ("/file.zip", False),
         ("/file.html", False),
         ("/file.jpg", False),
         ("/file.png", False),
@@ -738,7 +749,7 @@ class TestFailureCategorization:
         """Even if all downloads fail, processing should complete (not raise)."""
         body = (
             "File 1: https://host.com/a.pdf\n"
-            "File 2: https://host.com/b.docx"
+            "File 2: https://host.com/b.pdf"
         )
 
         @asynccontextmanager

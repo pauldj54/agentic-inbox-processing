@@ -71,32 +71,101 @@
     </header>
 
     <main class="container mx-auto px-6 py-8">
+        <!-- Date Filter Bar -->
+        <section class="mb-6">
+            <form id="dateFilterForm" method="GET" action="/" class="flex flex-wrap items-end gap-3 bg-white rounded-lg shadow px-4 py-3">
+                <span class="text-sm font-medium text-gray-600 self-center">📅 Filter:</span>
+                <button type="submit" name="preset" value="today"
+                    class="px-3 py-1.5 text-sm rounded border {% if filter_preset == 'today' %}bg-primary text-white border-primary{% else %}bg-white text-gray-700 border-gray-300 hover:bg-gray-50{% endif %}">
+                    Today
+                </button>
+                <button type="submit" name="preset" value="7d"
+                    class="px-3 py-1.5 text-sm rounded border {% if filter_preset == '7d' %}bg-primary text-white border-primary{% else %}bg-white text-gray-700 border-gray-300 hover:bg-gray-50{% endif %}">
+                    Last 7 days
+                </button>
+                <button type="submit" name="preset" value="30d"
+                    class="px-3 py-1.5 text-sm rounded border {% if filter_preset == '30d' %}bg-primary text-white border-primary{% else %}bg-white text-gray-700 border-gray-300 hover:bg-gray-50{% endif %}">
+                    Last 30 days
+                </button>
+                <button type="submit" name="preset" value="all"
+                    class="px-3 py-1.5 text-sm rounded border {% if filter_preset == 'all' %}bg-primary text-white border-primary{% else %}bg-white text-gray-700 border-gray-300 hover:bg-gray-50{% endif %}">
+                    All time
+                </button>
+                <span class="text-gray-300 self-center">|</span>
+                <div class="flex items-end gap-2">
+                    <div>
+                        <label class="block text-xs text-gray-500 mb-0.5">From</label>
+                        <input type="date" name="date_from" value="{{ filter_date_from }}"
+                               class="px-2 py-1.5 text-sm border border-gray-300 rounded focus:ring-primary focus:border-primary" />
+                    </div>
+                    <div>
+                        <label class="block text-xs text-gray-500 mb-0.5">To</label>
+                        <input type="date" name="date_to" value="{{ filter_date_to }}"
+                               class="px-2 py-1.5 text-sm border border-gray-300 rounded focus:ring-primary focus:border-primary" />
+                    </div>
+                    <button type="submit" name="preset" value="custom"
+                        class="px-3 py-1.5 text-sm rounded border bg-white text-gray-700 border-gray-300 hover:bg-gray-50">
+                        Apply
+                    </button>
+                </div>
+            </form>
+        </section>
+
         <!-- PE Events Stats Section -->
         {% if pe_stats %}
         <section class="mb-8">
             <h2 class="text-xl font-semibold text-gray-800 mb-4">📊 PE Events Summary</h2>
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-7 gap-4">
+                <!-- Unique Events -->
                 <div class="bg-white rounded-lg shadow p-4">
                     <div class="text-3xl font-bold text-primary">{{ pe_stats.totalEvents }}</div>
                     <div class="text-sm text-gray-500">Unique Events</div>
                 </div>
+                <!-- Emails: total / duplicate -->
                 <div class="bg-white rounded-lg shadow p-4">
-                    <div class="text-3xl font-bold text-gray-700">{{ pe_stats.totalEmails }}</div>
+                    <div class="text-3xl font-bold text-gray-700">{{ intake_stats.emailTotal }}</div>
                     <div class="text-sm text-gray-500">Total Emails</div>
                 </div>
                 <div class="bg-white rounded-lg shadow p-4">
-                    <div class="text-3xl font-bold text-orange-500">{{ pe_stats.duplicateEmails }}</div>
+                    <div class="text-3xl font-bold text-orange-500">{{ intake_stats.emailDuplicate }}</div>
                     <div class="text-sm text-gray-500">Duplicate Emails</div>
                 </div>
+                <!-- SFTP: total / duplicate -->
                 <div class="bg-white rounded-lg shadow p-4">
-                    <div class="text-sm text-gray-600">
-                        {% for event_type, data in pe_stats.byEventType.items() %}
-                        <div class="flex justify-between py-1">
-                            <span>{{ event_type }}</span>
-                            <span class="font-medium">{{ data.events }} <span class="text-xs text-gray-400">({{ data.emails }} emails)</span></span>
-                        </div>
-                        {% endfor %}
+                    <div class="text-3xl font-bold text-green-600">{{ intake_stats.sftpTotal }}</div>
+                    <div class="text-sm text-gray-500">Total SFTP Files</div>
+                </div>
+                <div class="bg-white rounded-lg shadow p-4">
+                    <div class="text-3xl font-bold text-orange-500">{{ intake_stats.sftpDuplicate }}</div>
+                    <div class="text-sm text-gray-500">Duplicate SFTP</div>
+                </div>
+                <!-- Combined totals -->
+                <div class="bg-white rounded-lg shadow p-4 border-l-4 border-primary">
+                    <div class="text-3xl font-bold text-primary">{{ intake_stats.combinedTotal }}</div>
+                    <div class="text-sm text-gray-500">Total Records</div>
+                    <div class="text-xs text-gray-400 mt-1">📧 {{ intake_stats.emailTotal }} + 📁 {{ intake_stats.sftpTotal }}</div>
+                </div>
+                <!-- Rejected Attachments -->
+                <div class="bg-white rounded-lg shadow p-4 border-l-4 border-red-400">
+                    <div class="text-3xl font-bold text-red-500">{{ rejected_attachments_count + rejected_links_count }}</div>
+                    <div class="text-sm text-gray-500">Rejected</div>
+                    <div class="text-xs text-gray-400 mt-1">
+                        {% if rejected_attachments_count > 0 %}📎 {{ rejected_attachments_count }} email{% endif %}
+                        {% if rejected_links_count > 0 %}{% if rejected_attachments_count > 0 %} · {% endif %}🔗 {{ rejected_links_count }} link{% endif %}
+                        {% if rejected_attachments_count == 0 and rejected_links_count == 0 %}All clear{% endif %}
                     </div>
+                </div>
+            </div>
+            <!-- Event type breakdown -->
+            <div class="mt-4 bg-white rounded-lg shadow p-4">
+                <h3 class="text-sm font-medium text-gray-600 mb-2">Classification Breakdown</h3>
+                <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-2">
+                    {% for event_type, data in pe_stats.byEventType.items()|sort %}
+                    <div class="flex justify-between items-center py-1 px-2 rounded bg-gray-50">
+                        <span class="text-sm text-gray-700">{{ event_type }}</span>
+                        <span class="text-sm font-medium text-gray-900">{{ data.events }} <span class="text-xs text-gray-400">({{ data.emails }} emails)</span></span>
+                    </div>
+                    {% endfor %}
                 </div>
             </div>
         </section>
@@ -178,22 +247,33 @@
                                     </td>
                                     <td class="px-4 py-3 whitespace-nowrap text-sm text-center">
                                         {% set att_count = email.attachmentsCount or 0 %}
-                                        {% if email.hasAttachments|parse_bool or att_count|int > 0 %}
+                                        {% set rejected = email.rejectedAttachments|default([])|list %}
+                                        {% set rejected_count = rejected|length %}
+                                        {% if email.linkDownload and email.linkDownload.failures %}
+                                            {% set link_rejected_count = email.linkDownload.failures|selectattr('error_type', 'equalto', 'content_type_not_allowed')|list|length %}
+                                        {% else %}
+                                            {% set link_rejected_count = 0 %}
+                                        {% endif %}
+                                        {% set link_dl_count = (email.linkDownload.downloaded_count if email.linkDownload and email.linkDownload.downloaded_count else 0)|int %}
+                                        {% set effective_att_count = att_count|int if att_count|int > 0 else link_dl_count %}
+                                        {% if email.hasAttachments|parse_bool or effective_att_count > 0 %}
                                             {% set attachments = email.attachmentPaths|normalize_attachments %}
-                                            {% set link_count = attachments|selectattr('source','equalto','link')|list|length %}
-                                            {% set file_count = (att_count|int) - link_count %}
-                                            <span class="text-green-600" title="{{ att_count }} attachment(s){% if link_count > 0 %} ({{ link_count }} from link){% endif %}">
-                                                ✅ {{ att_count }}
+                                            <span class="text-green-600" title="{{ effective_att_count }} attachment(s)">
+                                                ✅ {{ effective_att_count }}
                                             </span>
-                                            {% if link_count > 0 %}
-                                                <span class="text-xs text-blue-500 ml-1" title="{{ link_count }} from download link(s)">🔗{{ link_count }}</span>
-                                            {% endif %}
                                         {% else %}
                                             <span class="text-gray-400">—</span>
                                         {% endif %}
+                                        {% if rejected_count > 0 or link_rejected_count > 0 %}
+                                            <div class="mt-1">
+                                                <span class="text-xs text-red-500" title="{% for r in rejected %}{{ r.name }} ({{ r.contentType }}){% if not loop.last %}, {% endif %}{% endfor %}{% if link_rejected_count > 0 %}{% if rejected_count > 0 %}, {% endif %}{{ link_rejected_count }} link(s) blocked{% endif %}">
+                                                    🚫 {{ rejected_count + link_rejected_count }} blocked
+                                                </span>
+                                            </div>
+                                        {% endif %}
                                     </td>
                                     <td class="px-4 py-3 whitespace-nowrap text-sm text-center">
-                                        {% if email.intakeSource == 'sftp' %}
+                                        {% if email.version is defined and email.version is not none %}
                                             {% set ver = email.version|default(1) %}
                                             {% set dc = email.deliveryCount|default(1) %}
                                             <div class="flex flex-col items-center gap-0.5">
@@ -324,14 +404,12 @@
                                 
                                 {# Attachments indicator #}
                                 {% set att_count = msg.body.attachmentsCount or 0 %}
-                                {% if email.hasAttachments|parse_bool or msg.body.hasAttachments|parse_bool or att_count|int > 0 %}
+                                {% set msg_link_dl = msg.body.linkDownload or email.linkDownload %}
+                                {% set msg_link_dl_count = (msg_link_dl.downloaded_count if msg_link_dl and msg_link_dl.downloaded_count else 0)|int %}
+                                {% set msg_effective_att = att_count|int if att_count|int > 0 else msg_link_dl_count %}
+                                {% if email.hasAttachments|parse_bool or msg.body.hasAttachments|parse_bool or msg_effective_att > 0 %}
                                 <div class="mt-1">
-                                    {% set attachments = (email.attachmentPaths or msg.body.attachmentPaths)|normalize_attachments %}
-                                    {% set link_count = attachments|selectattr('source','equalto','link')|list|length %}
-                                    <span class="text-xs text-green-600">📎 {{ att_count }} attachment(s)</span>
-                                    {% if link_count > 0 %}
-                                        <span class="text-xs text-blue-500 ml-1">🔗 {{ link_count }} from link</span>
-                                    {% endif %}
+                                    <span class="text-xs text-green-600">📎 {{ msg_effective_att }} attachment(s)</span>
                                 </div>
                                 {% endif %}
                             </div>

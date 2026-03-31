@@ -123,6 +123,114 @@ class CosmosDBTools:
                 return items[0]
             return None
 
+    def find_by_content_hash(
+        self,
+        content_hash: str,
+        partition_key: str,
+    ) -> dict | None:
+        """Find an existing intake record by contentHash within a partition.
+
+        Args:
+            content_hash: Base64-encoded MD5 hash to search for.
+            partition_key: Cosmos DB partition key ({domain}_{YYYY-MM}).
+
+        Returns:
+            The matching record dict, or None if no match found.
+        """
+        if not content_hash:
+            return None
+
+        with self._get_sync_client() as client:
+            database = client.get_database_client(self.database_name)
+            container = database.get_container_client(self.CONTAINER_INTAKE_RECORDS)
+            query = "SELECT TOP 1 * FROM c WHERE c.contentHash = @contentHash"
+            items = list(container.query_items(
+                query=query,
+                parameters=[{"name": "@contentHash", "value": content_hash}],
+                partition_key=partition_key,
+            ))
+            if items:
+                logger.info(
+                    f"Found existing record by contentHash: id={items[0].get('id', '')[:20]}..., "
+                    f"deliveryCount={items[0].get('deliveryCount', 1)}"
+                )
+                return items[0]
+            return None
+
+    def find_by_filename(self, filename: str, partition_key: str) -> dict | None:
+        """Find an existing intake record with a matching attachment filename in the given partition.
+
+        Args:
+            filename: Original filename to search for in attachmentPaths.
+            partition_key: Cosmos DB partition key ({domain}_{YYYY-MM}).
+
+        Returns:
+            The matching record dict, or None if no match found.
+        """
+        if not filename:
+            return None
+
+        with self._get_sync_client() as client:
+            database = client.get_database_client(self.database_name)
+            container = database.get_container_client(self.CONTAINER_INTAKE_RECORDS)
+            query = (
+                "SELECT TOP 1 * FROM c "
+                "WHERE ARRAY_CONTAINS(c.attachmentPaths, {\"originalName\": @name}, true)"
+            )
+            items = list(container.query_items(
+                query=query,
+                parameters=[{"name": "@name", "value": filename}],
+                partition_key=partition_key,
+            ))
+            if items:
+                logger.info(
+                    f"Found existing record by filename: id={items[0].get('id', '')[:20]}..., "
+                    f"filename={filename}"
+                )
+                return items[0]
+            return None
+
+    def increment_delivery_count(
+        self,
+        record: dict,
+        content_hash: str,
+        action: str = "duplicate",
+    ) -> dict:
+        """Increment deliveryCount on an existing record and append to deliveryHistory.
+
+        Args:
+            record: The existing Cosmos DB record to update.
+            content_hash: Content hash of the new delivery.
+            action: Delivery action type ("duplicate" or "update").
+
+        Returns:
+            The updated record.
+        """
+        record["deliveryCount"] = record.get("deliveryCount", 1) + 1
+        record["lastDeliveredAt"] = datetime.utcnow().isoformat()
+        history = record.get("deliveryHistory", [])
+        history.append({
+            "deliveredAt": datetime.utcnow().isoformat(),
+            "contentHash": content_hash,
+            "action": action,
+        })
+        record["deliveryHistory"] = history
+        if action == "update":
+            record["version"] = record.get("version", 1) + 1
+            record["contentHash"] = content_hash
+        record["updatedAt"] = datetime.utcnow().isoformat()
+
+        with self._get_sync_client() as client:
+            database = client.get_database_client(self.database_name)
+            container = database.get_container_client(self.CONTAINER_INTAKE_RECORDS)
+            result = container.upsert_item(record)
+            logger.info(
+                f"Delivery tracking updated: id={record.get('id', '')[:20]}..., "
+                f"action={action}, deliveryCount={record['deliveryCount']}, "
+                f"version={record.get('version', 1)}"
+            )
+            return result
+
     def update_email_classification(
         self,
         email_id: str,
@@ -183,6 +291,7 @@ class CosmosDBTools:
                         "hasAttachments": parse_bool(email_data.get("hasAttachments", email_data.get("has_attachments", False))),
                         "attachmentsCount": int(att_count) if att_count else 0,
                         "attachmentPaths": email_data.get("attachmentPaths", []),
+                        "rejectedAttachments": email_data.get("rejectedAttachments", []),
                         "downloadFailures": [],  # Scaffold — populated by US2/T013
                         "intakeSource": "email",
                         "status": "received",
@@ -234,6 +343,9 @@ class CosmosDBTools:
                         doc["downloadFailures"] = link_result.get("failures", [])
                     elif "downloadFailures" not in doc:
                         doc["downloadFailures"] = []  # Scaffold empty array
+                    # Preserve rejectedAttachments written by the Logic App
+                    if "rejectedAttachments" not in doc:
+                        doc["rejectedAttachments"] = []
             
             # Update classification fields
             if step == "relevance":
@@ -496,7 +608,9 @@ class CosmosDBTools:
     def find_or_create_pe_event(
         self,
         email_id: str,
-        classification_details: dict
+        classification_details: dict,
+        intake_source: str = "email",
+        received_at: str = None
     ) -> Tuple[dict, bool]:
         """
         Find an existing PE event or create a new one.
@@ -505,6 +619,8 @@ class CosmosDBTools:
         Args:
             email_id: The email ID to link
             classification_details: Classification result with pe_company, fund_name, etc.
+            intake_source: "email" or "sftp"
+            received_at: ISO timestamp of the source record
             
         Returns:
             Tuple of (pe_event document, is_duplicate boolean)
@@ -514,6 +630,7 @@ class CosmosDBTools:
         event_type = classification_details.get("category", "Unknown")
         amount = classification_details.get("amount")
         due_date = classification_details.get("due_date")
+        received_at = received_at or datetime.utcnow().isoformat()
         
         # Generate dedup key
         dedup_key = self._generate_dedup_key(
@@ -550,6 +667,12 @@ class CosmosDBTools:
                 if email_id not in event["emailIds"]:
                     event["emailIds"].append(email_id)
                     event["emailCount"] = len(event["emailIds"])
+                    # Append to sourceRecords
+                    if "sourceRecords" not in event:
+                        event["sourceRecords"] = []
+                    event["sourceRecords"].append({
+                        "id": email_id, "source": intake_source, "receivedAt": received_at
+                    })
                     event["lastEmailAt"] = datetime.utcnow().isoformat()
                     event["updatedAt"] = datetime.utcnow().isoformat()
                     
@@ -571,10 +694,14 @@ class CosmosDBTools:
                     "eventType": event_type,
                     "peCompany": pe_company,
                     "fundName": fund_name,
+                    "investor": "Zava Private Bank",
                     "amount": amount,
                     "dueDate": due_date,
                     "emailIds": [email_id],
                     "emailCount": 1,
+                    "sourceRecords": [
+                        {"id": email_id, "source": intake_source, "receivedAt": received_at}
+                    ],
                     "status": "pending",  # pending, archived, reviewed
                     "createdAt": datetime.utcnow().isoformat(),
                     "lastEmailAt": datetime.utcnow().isoformat(),
