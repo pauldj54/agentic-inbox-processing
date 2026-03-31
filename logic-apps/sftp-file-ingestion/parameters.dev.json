@@ -40,12 +40,6 @@
                     "connectionName": "sftpwithssh",
                     "connectionProperties": {}
                 },
-                "sharepointonline": {
-                    "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/sharepointonline",
-                    "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/sharepointonline",
-                    "connectionName": "sharepointonline",
-                    "connectionProperties": {}
-                },
                 "documentdb": {
                     "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/documentdb",
                     "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/documentdb",
