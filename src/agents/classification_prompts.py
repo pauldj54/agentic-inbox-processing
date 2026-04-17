@@ -248,14 +248,41 @@ The management company, General Partner, or fund administrator. Examples:
 - "Apollo Global Management"
 If not found, use "Unknown".
 
+### Investor (investor)
+The investor or limited partner receiving the document. Examples:
+- "Zava Private Bank"
+- "Acme Pension Fund"
+If not explicitly stated, default to "Zava Private Bank".
+
+## Per-Document Event Extraction (CRITICAL)
+An email may contain **multiple attachments**, each representing a **separate PE event**.
+You MUST return a `pe_events` array with one entry per document/attachment that represents a distinct PE event.
+
+Each entry in `pe_events` must contain:
+- **document_name**: The attachment filename
+- **category**: The PE event type for THIS specific document
+- **pe_company**: The PE firm for THIS document
+- **fund_name**: The fund name for THIS document
+- **investor**: The investor/LP for THIS document (default: "Zava Private Bank")
+- **amount**: The monetary amount in THIS document (null if not found)
+- **due_date**: The due/effective date in THIS document (null if not found)
+- **confidence**: Confidence for THIS document's classification
+
+If there is only one attachment, `pe_events` should still be an array with one element.
+If two attachments describe the SAME event (same company, fund, type, amount, date, investor), they should still be listed as separate entries — deduplication is handled downstream.
+
+The top-level `category`, `fund_name`, `pe_company` fields should reflect the FIRST or primary document.
+
 ## Your Output
 Provide a structured JSON response with:
-1. **category**: One of the 10 PE event categories above
-2. **confidence**: 0.0 to 1.0
+1. **category**: One of the 10 PE event categories above (primary document)
+2. **confidence**: 0.0 to 1.0 (primary document)
 3. **reasoning**: Detailed explanation citing specific evidence
 4. **key_evidence**: List of phrases/sections that drove the decision
-5. **fund_name**: The PE fund name (REQUIRED)
-6. **pe_company**: The management company name (REQUIRED)
+5. **fund_name**: The PE fund name (primary document, REQUIRED)
+6. **pe_company**: The management company name (primary document, REQUIRED)
+7. **investor**: The investor name (primary document, default "Zava Private Bank")
+8. **pe_events**: Array of per-document event objects (REQUIRED)
 
 Remember: Attachments are crucial! A generic forwarding email with a "Capital Call Notice.pdf" should be classified as Capital Call based on the attachment content."""
 
@@ -396,6 +423,28 @@ CLASSIFICATION_OUTPUT_SCHEMA = {
             "type": "string",
             "description": "Name of the PE management company or General Partner (e.g., 'Blackstone Group', 'KKR & Co', 'Zava Asset Management')"
         },
+        "investor": {
+            "type": "string",
+            "description": "Investor or Limited Partner name (default: 'Zava Private Bank')"
+        },
+        "pe_events": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "document_name": {"type": "string", "description": "Attachment filename"},
+                    "category": {"type": "string", "enum": PE_CATEGORIES, "description": "PE event type for this document"},
+                    "pe_company": {"type": "string", "description": "PE firm for this document"},
+                    "fund_name": {"type": "string", "description": "Fund name for this document"},
+                    "investor": {"type": "string", "description": "Investor name (default: Zava Private Bank)"},
+                    "amount": {"type": "string", "description": "Monetary amount if found"},
+                    "due_date": {"type": "string", "description": "Due/effective date if found"},
+                    "confidence": {"type": "number", "description": "Confidence for this document"}
+                },
+                "required": ["document_name", "category", "pe_company", "fund_name", "investor", "confidence"]
+            },
+            "description": "Per-document event extraction — one entry per attachment/document"
+        },
         "amount": {
             "type": "string",
             "description": "Monetary amount if applicable (e.g., call amount, distribution amount)"
@@ -409,5 +458,36 @@ CLASSIFICATION_OUTPUT_SCHEMA = {
             "description": "Primary language of the email/attachment content (e.g., 'English', 'French', 'Mixed')"
         }
     },
-    "required": ["category", "confidence", "reasoning", "key_evidence", "fund_name", "pe_company"]
+    "required": ["category", "confidence", "reasoning", "key_evidence", "fund_name", "pe_company", "pe_events"]
 }
+
+
+# ============================================================================
+# Per-Document Entity Extraction (used in triage-only mode)
+# ============================================================================
+# In triage-only mode the full classification step is skipped, but we still
+# need per-document event attributes for deduplication and dashboard counts.
+
+DOCUMENT_EVENTS_SYSTEM_PROMPT = """You are a Private Equity document entity extractor for Zava Private Bank.
+You receive the extracted text of one or more PDF documents that have already been identified as PE-relevant.
+
+For EACH document, extract the following attributes:
+- **category**: The PE event type. Must be one of: Capital Call, Distribution Notice, Capital Account Statement, Quarterly Report, Annual Financial Statement, Tax Statement, Legal Notice, Subscription Agreement, Extension Notice, Dissolution Notice.
+- **pe_company**: The management company, General Partner, or fund administrator.
+- **fund_name**: The specific PE fund name.
+- **investor**: The investor or Limited Partner. Default to "Zava Private Bank" if not explicitly stated.
+- **amount**: The monetary amount (e.g., call amount, distribution amount). null if not found.
+- **due_date**: The due date or effective date. null if not found.
+- **confidence**: Your confidence in the extraction (0.0 to 1.0).
+
+## Language Support
+Documents may be in English, French, German, or other languages. Extract entities regardless of language and always respond in English.
+
+## Output
+Return a JSON object with a single key `pe_events` containing an array of objects, one per document."""
+
+DOCUMENT_EVENTS_USER_PROMPT = """Extract PE event attributes from each document below.
+
+{documents_text}
+
+Return JSON with: {{ "pe_events": [ {{ "document_name": "...", "category": "...", "pe_company": "...", "fund_name": "...", "investor": "...", "amount": "..." or null, "due_date": "..." or null, "confidence": 0.0-1.0 }} ] }}"""

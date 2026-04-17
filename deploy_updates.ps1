@@ -88,6 +88,16 @@ Remove-Item $emailFullPath -ErrorAction SilentlyContinue
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Email Logic App deployed successfully." -ForegroundColor Green
+    # Kick the Recurrence trigger — az logic workflow create can stall it
+    Write-Host "Restarting Recurrence trigger..." -ForegroundColor Gray
+    az rest --method post `
+      --url "https://management.azure.com/subscriptions/$((az account show --query id -o tsv))/resourceGroups/$resourceGroup/providers/Microsoft.Logic/workflows/$logicAppName/triggers/Recurrence/run?api-version=2016-06-01" `
+      2>$null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Recurrence trigger restarted." -ForegroundColor Green
+    } else {
+        Write-Host "Warning: could not restart trigger — manually run it in the portal." -ForegroundColor Yellow
+    }
 } else {
     Write-Host "Email Logic App deployment failed!" -ForegroundColor Red
 }
@@ -148,6 +158,16 @@ Remove-Item $fullPath -ErrorAction SilentlyContinue
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "SFTP Logic App deployed successfully." -ForegroundColor Green
+    # Kick the trigger — az logic workflow create can stall it
+    Write-Host "Restarting SFTP trigger..." -ForegroundColor Gray
+    az rest --method post `
+      --url "https://management.azure.com/subscriptions/$((az account show --query id -o tsv))/resourceGroups/$resourceGroup/providers/Microsoft.Logic/workflows/$sftpLogicAppName/triggers/When_files_are_added_or_modified/run?api-version=2016-06-01" `
+      2>$null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "SFTP trigger restarted." -ForegroundColor Green
+    } else {
+        Write-Host "Warning: could not restart SFTP trigger — manually run it in the portal." -ForegroundColor Yellow
+    }
 } else {
     Write-Host "SFTP Logic App deployment failed!" -ForegroundColor Red
 }

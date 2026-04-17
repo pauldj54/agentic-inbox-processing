@@ -31,7 +31,9 @@ from .classification_prompts import (
     RELEVANCE_OUTPUT_SCHEMA,
     CLASSIFICATION_OUTPUT_SCHEMA,
     PE_CATEGORIES,
-    NON_PE_CATEGORY
+    NON_PE_CATEGORY,
+    DOCUMENT_EVENTS_SYSTEM_PROMPT,
+    DOCUMENT_EVENTS_USER_PROMPT,
 )
 from .tools.queue_tools import QueueTools
 from .tools.graph_tools import GraphAPITools
@@ -117,6 +119,7 @@ class EmailClassificationAgent:
         # Agent instances (created on demand)
         self._relevance_agent = None
         self._classification_agent = None
+        self._doc_events_agent = None
     
     def _create_relevance_agent(self) -> Agent:
         """Create the relevance check agent."""
@@ -133,6 +136,15 @@ class EmailClassificationAgent:
             model=self.model_deployment,
             name="PE-Email-Classifier",
             instructions=FULL_CLASSIFICATION_SYSTEM_PROMPT,
+            response_format={"type": "json_object"}
+        )
+
+    def _create_doc_events_agent(self) -> Agent:
+        """Create the per-document entity extraction agent (triage-only mode)."""
+        return self.agents_client.create_agent(
+            model=self.model_deployment,
+            name="PE-Document-Entity-Extractor",
+            instructions=DOCUMENT_EVENTS_SYSTEM_PROMPT,
             response_format={"type": "json_object"}
         )
     
@@ -449,14 +461,27 @@ class EmailClassificationAgent:
                     triage_message["fileType"] = email_data.get("fileType", "")
                     triage_message["blobPath"] = email_data.get("blobPath", "")
 
-                triage_target = self.queue_tools.send_to_triage_queue(triage_message)
+                # Only send to triage-complete if there are actual stored documents
+                # (email attachments, successful link downloads, or SFTP files).
+                # If nothing was stored (e.g. all links blocked), there is nothing
+                # actionable for downstream consumers.
+                stored_docs = triage_message.get("attachmentPaths") or []
+                has_stored_documents = len(stored_docs) > 0
+
+                if has_stored_documents:
+                    triage_target = self.queue_tools.send_to_triage_queue(triage_message)
+                else:
+                    triage_target = None
+                    logger.info(
+                        f"Skipping triage-complete queue — no stored documents for {email_id[:30]}"
+                    )
 
                 # Update Cosmos with triage-only pipeline details
                 triage_classification_details = {
                     **relevance_result,
                     "pipelineMode": "triage-only",
                     "stepsExecuted": ["triage", "pre-processing", "routing"],
-                    "targetQueue": triage_target,
+                    "targetQueue": triage_target if has_stored_documents else "none (no documents)",
                 }
                 self.cosmos_tools.update_email_classification(
                     email_id=email_id,
@@ -467,28 +492,34 @@ class EmailClassificationAgent:
                     email_data=email_data,
                 )
 
-                # ── PE EVENT UPSERT (triage-only) ──
-                # Create/update a PE event record so the dashboard shows Unique Events
+                # ── PE EVENT UPSERT (triage-only, per-document) ──
+                # Extract per-document event attributes using the LLM,
+                # then create/update a PE event record for each document.
                 initial_cat = relevance_result.get("initial_category", "")
                 if initial_cat and initial_cat != NON_PE_CATEGORY:
                     try:
-                        pe_event, is_dup = self.cosmos_tools.find_or_create_pe_event(
-                            email_id=email_id,
-                            classification_details={
-                                "category": initial_cat,
-                                "pe_company": relevance_result.get("pe_company", "Unknown"),
-                                "fund_name": relevance_result.get("fund_name", "Unknown"),
-                                "confidence": relevance_result.get("confidence", 0.0),
-                                "reasoning": relevance_result.get("reasoning", ""),
-                                "key_evidence": relevance_result.get("key_evidence", []),
-                            },
-                            intake_source=intake_source,
-                            received_at=email_data.get("receivedAt", email_data.get("received_at", "")),
+                        per_doc_events = await self._extract_document_events(
+                            attachment_analysis, initial_category=initial_cat
                         )
-                        pe_event_id = pe_event.get("id") if pe_event else None
-                        logger.info(f"PE event {'linked' if is_dup else 'created'}: {pe_event_id} (triage-only)")
+                        for doc_event in per_doc_events:
+                            try:
+                                pe_event, is_dup = self.cosmos_tools.find_or_create_pe_event(
+                                    email_id=email_id,
+                                    classification_details=doc_event,
+                                    intake_source=intake_source,
+                                    received_at=email_data.get("receivedAt", email_data.get("received_at", "")),
+                                )
+                                pe_event_id = pe_event.get("id") if pe_event else None
+                                logger.info(
+                                    f"PE event {'linked' if is_dup else 'created'} for "
+                                    f"'{doc_event.get('document_name', '?')}': {pe_event_id} (triage-only)"
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to upsert PE event for '{doc_event.get('document_name', '?')}': {e}"
+                                )
                     except Exception as e:
-                        logger.warning(f"Failed to upsert PE event in triage-only mode: {e}")
+                        logger.warning(f"Failed per-document extraction in triage-only mode: {e}")
 
                 self.cosmos_tools.log_classification_event(
                     email_id=email_id,
@@ -540,31 +571,45 @@ class EmailClassificationAgent:
             )
             
             # =====================================================
-            # STEP 4a: PE EVENT DEDUPLICATION
+            # STEP 4a: PE EVENT DEDUPLICATION (per-document)
             # =====================================================
             is_duplicate = False
             pe_event_id = None
+            pe_event_ids = []
             if classification_result.get("category") not in ["Not PE Related"]:
-                try:
-                    pe_event, is_duplicate = self.cosmos_tools.find_or_create_pe_event(
-                        email_id=email_id,
-                        classification_details=classification_result,
-                        intake_source=intake_source,
-                        received_at=email_data.get("receivedAt", email_data.get("received_at", "")),
-                    )
-                    pe_event_id = pe_event.get("id") if pe_event else None
-                    
-                    if is_duplicate and pe_event_id:
-                        # Mark email as duplicate
-                        self.cosmos_tools.mark_email_as_duplicate(
+                # Use per-document pe_events array when available
+                per_doc_events = classification_result.get("pe_events") or []
+                if not per_doc_events:
+                    # Fallback: treat the whole classification as a single event
+                    per_doc_events = [classification_result]
+
+                for doc_event in per_doc_events:
+                    try:
+                        pe_event, is_dup = self.cosmos_tools.find_or_create_pe_event(
                             email_id=email_id,
-                            pe_event_id=pe_event_id
+                            classification_details=doc_event,
+                            intake_source=intake_source,
+                            received_at=email_data.get("receivedAt", email_data.get("received_at", "")),
                         )
-                        logger.info(f"Email is duplicate of PE event: {pe_event_id}")
-                    else:
-                        logger.info(f"New PE event created: {pe_event_id}")
-                except Exception as e:
-                    logger.warning(f"Failed to process PE event dedup: {e}")
+                        eid = pe_event.get("id") if pe_event else None
+                        if eid:
+                            pe_event_ids.append(eid)
+                        if is_dup:
+                            is_duplicate = True
+                            logger.info(f"Document '{doc_event.get('document_name', '?')}' linked to existing PE event: {eid}")
+                        else:
+                            logger.info(f"New PE event created for '{doc_event.get('document_name', '?')}': {eid}")
+                    except Exception as e:
+                        logger.warning(f"Failed to process PE event dedup for '{doc_event.get('document_name', '?')}': {e}")
+
+                pe_event_id = pe_event_ids[0] if pe_event_ids else None
+
+                if is_duplicate and pe_event_id:
+                    self.cosmos_tools.mark_email_as_duplicate(
+                        email_id=email_id,
+                        pe_event_id=pe_event_id
+                    )
+                    logger.info(f"Email is duplicate of PE event: {pe_event_id}")
             
             # Step 4b: Store extracted content in Cosmos
             for att in attachment_analysis:
@@ -744,8 +789,8 @@ class EmailClassificationAgent:
         """
         Download and process PDF attachments using Document Intelligence.
         
-        For email sources: downloads via Graph API.
-        For SFTP sources: reads from Azure Blob Storage (already uploaded by Logic App).
+        All sources (email, SFTP) read from Azure Blob Storage where the
+        Logic App has already uploaded the files.
         
         Args:
             email_data: Email/SFTP content with attachment info
@@ -771,76 +816,27 @@ class EmailClassificationAgent:
             logger.info("No attachments to process")
             return []
         
-        logger.info(f"Processing attachments (hasAttachments={has_attachments}, count={attachment_count})...")
-        
-        intake_source = email_data.get("intakeSource", "email")
-        
-        if intake_source == "sftp":
-            return await self._process_sftp_attachments(email_data, attachment_paths)
-        
-        # ── Email source: download via Graph API ──
-        graph_info = self.graph_tools.extract_email_info_from_message(email_data)
-        user_id = graph_info.get("user_id")
-        message_id = graph_info.get("message_id")
-        
-        logger.info(f"Graph API identifiers - user_id: {user_id}, message_id: {message_id[:50] if message_id else 'None'}...")
-        
-        if not user_id or not message_id:
-            logger.warning("Missing user_id or message_id for attachment download")
-            logger.warning(f"  email_data keys: {list(email_data.keys())}")
+        if not attachment_paths:
+            logger.warning("hasAttachments is true but no attachmentPaths — nothing to download")
             return []
         
-        # Download PDF attachments
-        try:
-            logger.info(f"Calling Graph API to download attachments...")
-            pdf_attachments = await self.graph_tools.download_all_pdf_attachments(
-                user_id=user_id,
-                message_id=message_id
-            )
-            logger.info(f"Downloaded {len(pdf_attachments)} PDF attachment(s)")
-            
-            if len(pdf_attachments) == 0:
-                logger.warning("Graph API returned 0 PDF attachments - check permissions or attachment types")
-        except Exception as e:
-            logger.error(f"Error downloading attachments: {e}", exc_info=True)
-            return []
+        logger.info(f"Processing {len(attachment_paths)} attachment(s) from blob storage...")
         
-        # Process each attachment with Document Intelligence
-        results = []
-        for attachment in pdf_attachments:
-            try:
-                content_bytes = attachment.get("content_decoded")
-                if content_bytes:
-                    logger.info(f"Analyzing attachment: {attachment.get('name', 'unknown')}")
-                    extracted = await self.doc_intel_tool.analyze_document_from_bytes(
-                        document_bytes=content_bytes,
-                        filename=attachment.get("name", "document.pdf")
-                    )
-                    
-                    results.append({
-                        "name": attachment.get("name"),
-                        "size": attachment.get("size"),
-                        "extracted_content": extracted
-                    })
-                    
-            except Exception as e:
-                logger.error(f"Error processing attachment {attachment.get('name')}: {e}")
-        
-        return results
-    
-    async def _process_sftp_attachments(self, email_data: dict, attachment_paths: list) -> list:
+        return await self._download_and_analyze_blobs(attachment_paths)
+
+    async def _download_and_analyze_blobs(self, attachment_paths: list) -> list:
         """
-        Process SFTP-sourced PDF attachments from Azure Blob Storage.
+        Download attachments from blob storage and analyze with Document Intelligence.
         
-        The Logic App has already uploaded the file to blob storage.
-        This method downloads from blob and processes with Document Intelligence.
+        Used for both email and SFTP sources — the Logic App uploads all
+        attachments to the 'attachments' container before queuing.
         """
         from azure.identity.aio import DefaultAzureCredential
         from azure.storage.blob.aio import BlobServiceClient
 
         storage_url = os.environ.get("STORAGE_ACCOUNT_URL")
         if not storage_url:
-            logger.error("STORAGE_ACCOUNT_URL not set — cannot read SFTP blob")
+            logger.error("STORAGE_ACCOUNT_URL not set — cannot read blobs")
             return []
 
         results = []
@@ -857,7 +853,7 @@ class EmailClassificationAgent:
                         blob_client = container_client.get_blob_client(blob_path)
                         download = await blob_client.download_blob()
                         content_bytes = await download.readall()
-                        logger.info(f"Downloaded SFTP blob: {blob_path} ({len(content_bytes)} bytes)")
+                        logger.info(f"Downloaded blob: {blob_path} ({len(content_bytes)} bytes)")
 
                         extracted = await self.doc_intel_tool.analyze_document_from_bytes(
                             document_bytes=content_bytes,
@@ -869,7 +865,7 @@ class EmailClassificationAgent:
                             "extracted_content": extracted,
                         })
                     except Exception as e:
-                        logger.error(f"Error processing SFTP blob {blob_path}: {e}", exc_info=True)
+                        logger.error(f"Error processing blob {blob_path}: {e}", exc_info=True)
         finally:
             await credential.close()
 
@@ -1073,7 +1069,81 @@ class EmailClassificationAgent:
                 pass
         
         return None
-    
+
+    async def _extract_document_events(self, attachment_analysis: list, initial_category: str = "Unknown") -> list:
+        """
+        Extract per-document PE event attributes using the LLM.
+
+        Called in triage-only mode where full classification is skipped but we
+        still need per-document event data for dedup and dashboard counts.
+
+        Args:
+            attachment_analysis: List of processed attachment results from
+                _process_attachments, each with {name, size, extracted_content}.
+            initial_category: The initial category from relevance check as hint.
+
+        Returns:
+            List of per-document event dicts with {document_name, category,
+            pe_company, fund_name, investor, amount, due_date, confidence}.
+        """
+        if not attachment_analysis:
+            return []
+
+        # Build per-document text for the prompt
+        docs_text = ""
+        for att in attachment_analysis:
+            extracted = att.get("extracted_content", {})
+            docs_text += f"\n### Document: {att.get('name', 'unknown')}\n"
+            docs_text += f"Pages: {extracted.get('page_count', 0)}\n"
+            docs_text += f"\n**Text content (first 2000 chars):**\n"
+            docs_text += extracted.get("full_text", "")[:2000]
+
+            tables = extracted.get("tables", [])
+            if tables:
+                docs_text += f"\n\n**Tables ({len(tables)} found):**\n"
+                for i, table in enumerate(tables[:3]):
+                    docs_text += f"\nTable {i+1} ({table.get('row_count')}x{table.get('column_count')}):\n"
+                    for row in table.get("rows", [])[:5]:
+                        docs_text += " | ".join(str(cell)[:30] for cell in row) + "\n"
+
+            docs_text += "\n---\n"
+
+        user_prompt = DOCUMENT_EVENTS_USER_PROMPT.format(documents_text=docs_text)
+
+        if not self._doc_events_agent:
+            self._doc_events_agent = self._create_doc_events_agent()
+
+        run = self.agents_client.create_thread_and_process_run(
+            agent_id=self._doc_events_agent.id,
+            thread={"messages": [{"role": "user", "content": user_prompt}]}
+        )
+
+        messages = self.agents_client.messages.list(thread_id=run.thread_id)
+        for msg in messages:
+            if msg.role == "assistant":
+                for content in msg.content:
+                    if hasattr(content, 'text'):
+                        parsed = self._extract_json_from_response(content.text.value)
+                        if parsed and "pe_events" in parsed:
+                            logger.info(f"Extracted {len(parsed['pe_events'])} per-document events")
+                            return parsed["pe_events"]
+
+        # Fallback: one event per attachment with only the initial_category
+        logger.warning("Per-document extraction failed, falling back to one event per attachment")
+        return [
+            {
+                "document_name": att.get("name", "unknown"),
+                "category": initial_category,
+                "pe_company": "Unknown",
+                "fund_name": "Unknown",
+                "investor": "Zava Private Bank",
+                "amount": None,
+                "due_date": None,
+                "confidence": 0.5,
+            }
+            for att in attachment_analysis
+        ]
+
     def cleanup(self):
         """Clean up agent resources."""
         if self._relevance_agent:
@@ -1085,6 +1155,12 @@ class EmailClassificationAgent:
         if self._classification_agent:
             try:
                 self.agents_client.delete_agent(self._classification_agent.id)
+            except:
+                pass
+
+        if self._doc_events_agent:
+            try:
+                self.agents_client.delete_agent(self._doc_events_agent.id)
             except:
                 pass
 

@@ -103,6 +103,9 @@ async def lifespan(app: FastAPI):
     )
     executor = ThreadPoolExecutor(max_workers=2)  # Reduce workers to avoid auth conflicts
 
+    print(f"QUEUE_NAMES = {QUEUE_NAMES}")
+    print(f"PIPELINE_MODE = {_pipeline_mode}")
+
     # Start agent background thread if AI endpoint is configured
     ai_endpoint = os.environ.get("AZURE_AI_PROJECT_ENDPOINT")
     if ai_endpoint:
@@ -265,7 +268,7 @@ templates.env.filters["normalize_attachments"] = normalize_attachments
 templates.env.filters["attachment_source_icon"] = attachment_source_icon
 
 
-def _get_emails_from_cosmos_sync(limit: int = 20) -> list:
+def _get_emails_from_cosmos_sync(limit: int = 20, date_from: str = None, date_to: str = None) -> list:
     """Fetch recent emails from Cosmos DB (sync)."""
     try:
         database = cosmos_client.get_database_client(COSMOS_DATABASE)
@@ -282,20 +285,28 @@ def _get_emails_from_cosmos_sync(limit: int = 20) -> list:
         ):
             if "intakeSource" not in item:
                 item["intakeSource"] = "email"
+            if item.get("type") == "processed-marker":
+                continue
+            # Apply date filter on receivedAt
+            received = item.get("receivedAt", "")
+            if date_from and received < date_from:
+                continue
+            if date_to and received > date_to:
+                continue
             emails.append(item)
         
-        # Sort client-side and limit
-        emails.sort(key=lambda x: x.get("receivedAt", ""), reverse=True)
+        # Sort by last-modified (_ts) so recently updated records appear first
+        emails.sort(key=lambda x: x.get("_ts", 0), reverse=True)
         return emails[:limit]
     except Exception as e:
         print(f"Error fetching emails from Cosmos DB: {e}")
         return []
 
 
-async def get_emails_from_cosmos(limit: int = 20) -> list:
+async def get_emails_from_cosmos(limit: int = 20, date_from: str = None, date_to: str = None) -> list:
     """Fetch recent emails from Cosmos DB."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(executor, _get_emails_from_cosmos_sync, limit)
+    return await loop.run_in_executor(executor, _get_emails_from_cosmos_sync, limit, date_from, date_to)
 
 
 def _get_queue_messages_sync(queue_name: str, max_count: int = 10) -> list:
@@ -477,6 +488,8 @@ def _get_intake_stats_sync(date_from: str = None, date_to: str = None) -> dict:
             query=query,
             enable_cross_partition_query=True,
         ):
+            if item.get("intakeSource") is None and item.get("deliveryCount") is None:
+                continue  # skip processed-marker records
             received = item.get("receivedAt", "")
             if date_from and received < date_from:
                 continue
@@ -548,8 +561,8 @@ async def dashboard(request: Request):
     if date_to and len(date_to) == 10:
         date_to += "T23:59:59"
     
-    # Fetch emails from Cosmos DB
-    emails = await get_emails_from_cosmos(limit=20)
+    # Fetch emails from Cosmos DB (with date filter)
+    emails = await get_emails_from_cosmos(limit=50, date_from=date_from or None, date_to=date_to or None)
     
     # Compute attachment security stats
     total_rejected = sum(len(e.get("rejectedAttachments") or []) for e in emails)
@@ -565,11 +578,47 @@ async def dashboard(request: Request):
     
     # Fetch messages from all queues (sequentially to avoid auth conflicts)
     queue_messages = {}
+    # Parse date bounds for queue message filtering
+    _filter_from_dt = None
+    _filter_to_dt = None
+    if date_from:
+        try:
+            _filter_from_dt = datetime.fromisoformat(date_from).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    if date_to:
+        try:
+            _filter_to_dt = datetime.fromisoformat(date_to).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+
     for queue_name in QUEUE_NAMES:
         try:
-            queue_messages[queue_name] = await get_queue_messages(queue_name, max_count=10)
+            msgs = await get_queue_messages(queue_name, max_count=50)
+            # Apply date filter on enqueued_time
+            if _filter_from_dt or _filter_to_dt:
+                filtered = []
+                for m in msgs:
+                    et = m.get("enqueued_time")
+                    if et is None:
+                        filtered.append(m)
+                        continue
+                    # Ensure timezone-aware comparison
+                    if hasattr(et, "tzinfo") and et.tzinfo is None:
+                        et = et.replace(tzinfo=timezone.utc)
+                    if _filter_from_dt and et < _filter_from_dt:
+                        continue
+                    if _filter_to_dt and et > _filter_to_dt:
+                        continue
+                    filtered.append(m)
+                msgs = filtered
+            # Sort newest first
+            msgs.sort(key=lambda m: m.get("enqueued_time") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+            queue_messages[queue_name] = msgs
+            print(f"Queue {queue_name}: {len(queue_messages[queue_name])} messages")
         except Exception as e:
             print(f"Failed to get messages from {queue_name}: {e}")
+            import traceback; traceback.print_exc()
             queue_messages[queue_name] = []
     
     return templates.TemplateResponse(

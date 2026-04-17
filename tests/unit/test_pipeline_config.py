@@ -176,6 +176,9 @@ class TestPipelineModeRouting:
         # Mock attachment processing
         agent._process_attachments = AsyncMock(return_value=[])
 
+        # Mock per-document event extraction (returns empty since no attachments)
+        agent._extract_document_events = AsyncMock(return_value=[])
+
         # Mock classification — should NOT be called
         agent._classify_email = AsyncMock(return_value={})
 
@@ -183,6 +186,9 @@ class TestPipelineModeRouting:
         agent.cosmos_tools.log_classification_event = MagicMock()
         agent.cosmos_tools.update_email_classification = MagicMock(return_value={})
         agent.cosmos_tools.get_email_document = MagicMock(return_value=None)
+        agent.cosmos_tools.find_or_create_pe_event = MagicMock(
+            return_value=({"id": "pe-event-1"}, False)
+        )
 
         result = await agent.process_next_email()
 

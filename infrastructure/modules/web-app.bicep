@@ -58,7 +58,7 @@ resource webApp 'Microsoft.Web/sites@2023-12-01' = {
     httpsOnly: true
     publicNetworkAccess: 'Enabled'
     siteConfig: {
-      linuxFxVersion: 'PYTHON|3.11'
+      linuxFxVersion: 'PYTHON|3.12'
       alwaysOn: false // Can be false for MVP to save costs
       ftpsState: 'Disabled'
       minTlsVersion: '1.2'

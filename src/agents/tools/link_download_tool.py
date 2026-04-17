@@ -20,6 +20,12 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from urllib.parse import urlparse, unquote
 
+import urllib.request
+import urllib.error
+import http.client
+import socket
+import ssl
+
 import aiohttp
 from azure.identity.aio import DefaultAzureCredential
 from azure.storage.blob.aio import BlobServiceClient
@@ -489,6 +495,17 @@ class LinkDownloadTool:
             return None
 
         except aiohttp.ClientError as exc:
+            # IDNA encoding errors may surface as ClientConnectorError.
+            # Fall back to stdlib urllib which does not require the idna package.
+            if "idna" in str(exc).lower() or "unicode" in str(exc).lower():
+                logger.warning(
+                    "aiohttp IDNA/unicode error, retrying with urllib fallback",
+                    extra={**log_ctx, "original_error": str(exc)},
+                )
+                return await self._download_with_urllib_fallback(
+                    blob_service, email_id, url, result,
+                )
+
             elapsed = time.monotonic() - start
             failure = DownloadFailure(
                 url=url,
@@ -504,6 +521,17 @@ class LinkDownloadTool:
             return None
 
         except Exception as exc:
+            # IDNA encoding errors surface as UnicodeError inside aiohttp/yarl.
+            # Fall back to stdlib urllib which does not require the idna package.
+            if "idna" in str(exc).lower() or "UnicodeError" in type(exc).__name__:
+                logger.warning(
+                    "aiohttp IDNA error, retrying with urllib fallback",
+                    extra={**log_ctx, "original_error": str(exc)},
+                )
+                return await self._download_with_urllib_fallback(
+                    blob_service, email_id, url, result,
+                )
+
             elapsed = time.monotonic() - start
             failure = DownloadFailure(
                 url=url,
@@ -515,6 +543,176 @@ class LinkDownloadTool:
             logger.error(
                 "Download failed: unexpected error",
                 extra={**log_ctx, "error_type": "unknown", "error": str(exc), "elapsed_s": round(elapsed, 3)},
+                exc_info=True,
+            )
+            return None
+
+    async def _download_with_urllib_fallback(
+        self,
+        blob_service: BlobServiceClient,
+        email_id: str,
+        url: str,
+        result: LinkDownloadResult,
+    ) -> DownloadedFile | None:
+        """Fallback download that bypasses Python's IDNA codec.
+
+        On Azure App Service Linux + Python 3.12, the built-in encodings.idna
+        codec (used by socket.getaddrinfo for str hostnames) fails with
+        'label empty or too long' for certain hostnames. This fallback:
+        1. Resolves the hostname to an IP by passing hostname as bytes to
+           socket.getaddrinfo (bytes bypass the IDNA codec at the C level).
+        2. Creates a raw TCP socket to the resolved IP.
+        3. Wraps the socket in SSL with proper SNI (server_hostname).
+        4. Sends the HTTP request with the correct Host header.
+        """
+        start = time.monotonic()
+        log_ctx = {"email_id": email_id, "url": url, "method": "direct_https_fallback"}
+
+        try:
+            parsed = urlparse(url)
+            hostname = parsed.hostname or ""
+            port = parsed.port or 443
+            request_path = parsed.path or "/"
+            if parsed.query:
+                request_path += "?" + parsed.query
+
+            loop = asyncio.get_event_loop()
+
+            def _sync_download():
+                # Resolve hostname with bytes to bypass IDNA codec
+                addr_info = socket.getaddrinfo(
+                    hostname.encode("ascii"), port,
+                    socket.AF_INET, socket.SOCK_STREAM,
+                )
+                ip = addr_info[0][4][0]
+                logger.info(
+                    f"DNS resolved (IDNA bypass): {hostname} -> {ip}",
+                    extra=log_ctx,
+                )
+
+                # TCP connect to IP
+                sock = socket.create_connection(
+                    (ip, port), timeout=self.download_timeout_seconds
+                )
+                # SSL with SNI
+                ctx = ssl.create_default_context()
+                ssl_sock = ctx.wrap_socket(sock, server_hostname=hostname)
+
+                # HTTP request
+                conn = http.client.HTTPSConnection(hostname, port)
+                conn.sock = ssl_sock
+                conn.request(
+                    "GET", request_path,
+                    headers={"Host": hostname, "User-Agent": "agentic-inbox/1.0"},
+                )
+                return conn.getresponse()
+
+            response = await loop.run_in_executor(None, _sync_download)
+            status = response.status
+
+            if status != 200:
+                failure = DownloadFailure(
+                    url=url,
+                    error=f"HTTP {status}",
+                    attempted_at=datetime.now(timezone.utc).isoformat(),
+                    error_type="http_error",
+                    http_status=status,
+                )
+                result.failures.append(failure)
+                return None
+
+            content_type = response.getheader("Content-Type", "application/octet-stream")
+            ct_lower = content_type.lower().split(";")[0].strip()
+
+            if ct_lower in _NON_DOCUMENT_CONTENT_TYPES or any(
+                ct_lower.startswith(p) for p in _NON_DOCUMENT_MIME_PREFIXES
+            ):
+                failure = DownloadFailure(
+                    url=url,
+                    error=f"Non-document content-type: {content_type}",
+                    attempted_at=datetime.now(timezone.utc).isoformat(),
+                    error_type="content_type_rejected",
+                )
+                result.failures.append(failure)
+                return None
+
+            # Derive filename from URL path
+            path_segment = unquote(parsed.path.split("/")[-1])
+            if path_segment and "." in path_segment:
+                filename = path_segment
+            else:
+                ext = mimetypes.guess_extension(content_type) or ""
+                filename = f"download_{uuid.uuid4().hex[:8]}{ext}"
+
+            # Check allowed content type / extension
+            if not is_allowed_content_type(content_type) and not is_allowed_extension(filename):
+                allowed_str = ", ".join(sorted(ALLOWED_CONTENT_TYPES))
+                failure = DownloadFailure(
+                    url=url,
+                    error=f"Content type '{content_type}' not in allowed list ({allowed_str})",
+                    attempted_at=datetime.now(timezone.utc).isoformat(),
+                    error_type="content_type_not_allowed",
+                )
+                result.failures.append(failure)
+                return None
+
+            file_data = await loop.run_in_executor(None, response.read)
+
+            if len(file_data) > self.max_file_size_bytes:
+                failure = DownloadFailure(
+                    url=url,
+                    error=f"File size {len(file_data)} exceeds limit {self.max_file_size_bytes}",
+                    attempted_at=datetime.now(timezone.utc).isoformat(),
+                    error_type="size_exceeded",
+                )
+                result.failures.append(failure)
+                return None
+
+            content_md5 = base64.b64encode(
+                hashlib.md5(file_data).digest()
+            ).decode()
+
+            blob_path = f"{email_id}/{filename}"
+            container_client = blob_service.get_container_client(self.container_name)
+            blob_client = container_client.get_blob_client(blob_path)
+            await blob_client.upload_blob(
+                file_data,
+                overwrite=True,
+                content_settings=ContentSettings(content_type=content_type),
+            )
+
+            elapsed = time.monotonic() - start
+            logger.info(
+                "Direct HTTPS fallback download+upload succeeded",
+                extra={
+                    **log_ctx,
+                    "blob_path": blob_path,
+                    "bytes": len(file_data),
+                    "content_type": content_type,
+                    "elapsed_s": round(elapsed, 3),
+                },
+            )
+
+            return DownloadedFile(
+                path=blob_path,
+                source="link",
+                url=url,
+                content_type=content_type,
+                content_md5=content_md5,
+            )
+
+        except Exception as exc:
+            elapsed = time.monotonic() - start
+            failure = DownloadFailure(
+                url=url,
+                error=f"direct HTTPS fallback failed: {exc}",
+                attempted_at=datetime.now(timezone.utc).isoformat(),
+                error_type="unknown",
+            )
+            result.failures.append(failure)
+            logger.error(
+                "Direct HTTPS fallback download failed",
+                extra={**log_ctx, "error": str(exc), "elapsed_s": round(elapsed, 3)},
                 exc_info=True,
             )
             return None

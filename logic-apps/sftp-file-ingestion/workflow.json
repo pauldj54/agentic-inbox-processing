@@ -173,7 +173,7 @@
                 "inputs": {
                   "host": {
                     "connection": {
-                      "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+                      "name": "@parameters('$connections')['sftpwithssh']['connectionId']"
                     }
                   },
                   "method": "post",
@@ -202,7 +202,7 @@
                 "inputs": {
                   "host": {
                     "connection": {
-                      "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+                      "name": "@parameters('$connections')['sftpwithssh']['connectionId']"
                     }
                   },
                   "method": "delete",
@@ -311,7 +311,7 @@
                     "inputs": {
                       "host": {
                         "connection": {
-                          "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+                          "name": "@parameters('$connections')['sftpwithssh']['connectionId']"
                         }
                       },
                       "method": "post",
@@ -336,7 +336,7 @@
                     "inputs": {
                       "host": {
                         "connection": {
-                          "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+                          "name": "@parameters('$connections')['sftpwithssh']['connectionId']"
                         }
                       },
                       "method": "delete",
@@ -712,7 +712,7 @@
             "inputs": {
               "host": {
                 "connection": {
-                  "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+                  "name": "@parameters('$connections')['sftpwithssh']['connectionId']"
                 }
               },
               "method": "post",
@@ -785,7 +785,7 @@
             "inputs": {
               "host": {
                 "connection": {
-                  "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+                  "name": "@parameters('$connections')['sftpwithssh']['connectionId']"
                 }
               },
               "method": "delete",
@@ -817,7 +817,7 @@
               "inputs": {
                 "host": {
                   "connection": {
-                    "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+                    "name": "@parameters('$connections')['sftpwithssh']['connectionId']"
                   }
                 },
                 "method": "delete",
@@ -849,7 +849,7 @@
         "inputs": {
           "host": {
             "connection": {
-              "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+              "name": "@parameters('$connections')['sftpwithssh']['connectionId']"
             }
           },
           "method": "post",
@@ -943,7 +943,7 @@
         "inputs": {
           "host": {
             "connection": {
-              "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+              "name": "@parameters('$connections')['sftpwithssh']['connectionId']"
             }
           },
           "method": "delete",
@@ -975,7 +975,7 @@
         "inputs": {
           "host": {
             "connection": {
-              "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+              "name": "@parameters('$connections')['sftpwithssh']['connectionId']"
             }
           },
           "method": "post",
@@ -1005,7 +1005,7 @@
         "inputs": {
           "host": {
             "connection": {
-              "name": "@parameters('$connections')['sftpwithssh-1']['connectionId']"
+              "name": "@parameters('$connections')['sftpwithssh']['connectionId']"
             }
           },
           "method": "delete",
@@ -1104,7 +1104,7 @@
             }
           }
         },
-        "sftpwithssh-1": {
+        "sftpwithssh": {
           "id": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/providers/Microsoft.Web/locations/swedencentral/managedApis/sftpwithssh",
           "connectionId": "/subscriptions/6998587d-ecee-452a-83ec-3e6c5a713251/resourceGroups/rg-docproc-dev/providers/Microsoft.Web/connections/sftpwithssh",
           "connectionName": "sftpwithssh",

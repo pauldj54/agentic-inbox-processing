@@ -541,7 +541,8 @@ class CosmosDBTools:
         fund_name: str,
         event_type: str,
         amount: Optional[str] = None,
-        due_date: Optional[str] = None
+        due_date: Optional[str] = None,
+        investor: Optional[str] = None
     ) -> str:
         """
         Generate a deduplication key for PE events.
@@ -554,6 +555,7 @@ class CosmosDBTools:
             event_type: Type of event (Capital Call, Distribution, etc.)
             amount: Transaction amount (optional)
             due_date: Due date (optional)
+            investor: Investor / LP name (optional)
             
         Returns:
             SHA256 hash string (first 16 chars)
@@ -596,7 +598,8 @@ class CosmosDBTools:
             normalize(fund_name),
             normalize(event_type),
             amount_key,
-            date_key
+            date_key,
+            normalize(investor or "zava private bank"),
         ]
         
         key_string = "|".join(key_parts)
@@ -630,6 +633,7 @@ class CosmosDBTools:
         event_type = classification_details.get("category", "Unknown")
         amount = classification_details.get("amount")
         due_date = classification_details.get("due_date")
+        investor = classification_details.get("investor", "Zava Private Bank")
         received_at = received_at or datetime.utcnow().isoformat()
         
         # Generate dedup key
@@ -638,7 +642,8 @@ class CosmosDBTools:
             fund_name=fund_name,
             event_type=event_type,
             amount=amount,
-            due_date=due_date
+            due_date=due_date,
+            investor=investor,
         )
         
         logger.info(f"Looking for PE event with dedup key: {dedup_key}")
@@ -694,7 +699,7 @@ class CosmosDBTools:
                     "eventType": event_type,
                     "peCompany": pe_company,
                     "fundName": fund_name,
-                    "investor": "Zava Private Bank",
+                    "investor": investor,
                     "amount": amount,
                     "dueDate": due_date,
                     "emailIds": [email_id],
