@@ -1,24 +1,76 @@
 # ============================================================================
 # Deploy all resources
 # Resources: Logic Apps (email + SFTP) + Web App (Python code)
-# Resource Group: rg-docproc-dev
+# Resource names are loaded from .env01
 #
 # Usage:
 #   .\deploy_updates.ps1                   # defaults to -Environment dev
 #   .\deploy_updates.ps1 -Environment prod
+#   .\deploy_updates.ps1 -Subscription <subscription-id> # overrides .env01
 # ============================================================================
 param(
     [ValidateSet("dev", "prod")]
-    [string]$Environment = "dev"
+    [string]$Environment = "dev",
+  [string]$Subscription = ""
 )
 
-Write-Host "Deploying with environment: $Environment" -ForegroundColor Cyan
+function Import-DotEnvFile {
+  param([string]$Path)
 
-$resourceGroup    = "rg-docproc-dev"
-$logicAppName     = "logic-docproc-dev-izr2ch55woa3c"
-$sftpLogicAppName = "logic-sftp-docproc-dev-izr2ch55woa3c"
-$webAppName       = "app-docproc-dev-izr2ch55woa3c"
-$keyVaultName     = "kv-docproc-dev-izr2ch55"
+  if (-not (Test-Path $Path)) {
+    return
+  }
+
+  Get-Content $Path | ForEach-Object {
+    $line = $_.Trim()
+    if (-not $line -or $line.StartsWith("#") -or -not $line.Contains("=")) {
+      return
+    }
+
+    $key, $value = $line -split "=", 2
+    $key = $key.Trim()
+    $value = $value.Trim().Trim('"').Trim("'")
+    if ($key) {
+      [Environment]::SetEnvironmentVariable($key, $value, "Process")
+    }
+  }
+}
+
+Import-DotEnvFile -Path ".env01"
+
+if ([string]::IsNullOrWhiteSpace($Subscription)) {
+  $Subscription = $env:AZURE_SUBSCRIPTION_ID
+}
+
+if ([string]::IsNullOrWhiteSpace($Subscription)) {
+  Write-Host "AZURE_SUBSCRIPTION_ID is not set in .env01 and -Subscription was not provided." -ForegroundColor Red
+  Write-Host "Add AZURE_SUBSCRIPTION_ID=<subscription-id> to .env01 or pass -Subscription explicitly." -ForegroundColor Yellow
+  exit 1
+}
+
+Write-Host "Deploying with environment: $Environment" -ForegroundColor Cyan
+Write-Host "Using Azure subscription: $Subscription" -ForegroundColor Cyan
+
+$requiredConfig = @{
+  "AZURE_RESOURCE_GROUP" = $env:AZURE_RESOURCE_GROUP
+  "EMAIL_LOGIC_APP_NAME" = $env:EMAIL_LOGIC_APP_NAME
+  "SFTP_LOGIC_APP_NAME" = $env:SFTP_LOGIC_APP_NAME
+  "WEB_APP_NAME" = $env:WEB_APP_NAME
+  "KEY_VAULT_NAME" = $env:KEY_VAULT_NAME
+}
+
+foreach ($configName in $requiredConfig.Keys) {
+  if ([string]::IsNullOrWhiteSpace($requiredConfig[$configName])) {
+    Write-Host "$configName is not set in .env01." -ForegroundColor Red
+    exit 1
+  }
+}
+
+$resourceGroup    = $env:AZURE_RESOURCE_GROUP
+$logicAppName     = $env:EMAIL_LOGIC_APP_NAME
+$sftpLogicAppName = $env:SFTP_LOGIC_APP_NAME
+$webAppName       = $env:WEB_APP_NAME
+$keyVaultName     = $env:KEY_VAULT_NAME
 
 # --- 1a. Deploy Email Logic App workflow ---
 Write-Host "`n=== Deploying Email Logic App workflow ===" -ForegroundColor Cyan
@@ -26,6 +78,7 @@ Write-Host "`n=== Deploying Email Logic App workflow ===" -ForegroundColor Cyan
 # Fetch Graph API client secret from Key Vault (never stored in source control)
 Write-Host "Fetching Graph API client secret from Key Vault..." -ForegroundColor Gray
 $graphSecret = az keyvault secret show `
+  --subscription $Subscription `
   --vault-name $keyVaultName `
   --name "graph-client-secret" `
   --query "value" -o tsv
@@ -79,9 +132,11 @@ $emailFullPath = "$env:TEMP\email-la-full.json"
 $emailWfJson | ConvertTo-Json -Depth 50 | Set-Content -Path $emailFullPath -Encoding UTF8
 
 az logic workflow create `
+  --subscription $Subscription `
   --resource-group $resourceGroup `
   --name $logicAppName `
-  --definition "@$emailFullPath"
+  --definition "@$emailFullPath" `
+  -o none
 
 # Clean up temp file
 Remove-Item $emailFullPath -ErrorAction SilentlyContinue
@@ -91,7 +146,7 @@ if ($LASTEXITCODE -eq 0) {
     # Kick the Recurrence trigger — az logic workflow create can stall it
     Write-Host "Restarting Recurrence trigger..." -ForegroundColor Gray
     az rest --method post `
-      --url "https://management.azure.com/subscriptions/$((az account show --query id -o tsv))/resourceGroups/$resourceGroup/providers/Microsoft.Logic/workflows/$logicAppName/triggers/Recurrence/run?api-version=2016-06-01" `
+      --url "https://management.azure.com/subscriptions/$Subscription/resourceGroups/$resourceGroup/providers/Microsoft.Logic/workflows/$logicAppName/triggers/Recurrence/run?api-version=2016-06-01" `
       2>$null
     if ($LASTEXITCODE -eq 0) {
         Write-Host "Recurrence trigger restarted." -ForegroundColor Green
@@ -108,6 +163,7 @@ Write-Host "`n=== Deploying SFTP Logic App workflow ===" -ForegroundColor Cyan
 # Fetch SharePoint client secret from Key Vault (never stored in source control)
 Write-Host "Fetching SharePoint client secret from Key Vault..." -ForegroundColor Gray
 $spSecret = az keyvault secret show `
+  --subscription $Subscription `
   --vault-name $keyVaultName `
   --name "sharepoint-client-secret" `
   --query "value" -o tsv
@@ -149,9 +205,11 @@ $fullPath = "$env:TEMP\sftp-la-full.json"
 $wfJson | ConvertTo-Json -Depth 50 | Set-Content -Path $fullPath -Encoding UTF8
 
 az logic workflow create `
+  --subscription $Subscription `
   --resource-group $resourceGroup `
   --name $sftpLogicAppName `
-  --definition "@$fullPath"
+  --definition "@$fullPath" `
+  -o none
 
 # Clean up temp file
 Remove-Item $fullPath -ErrorAction SilentlyContinue
@@ -161,7 +219,7 @@ if ($LASTEXITCODE -eq 0) {
     # Kick the trigger — az logic workflow create can stall it
     Write-Host "Restarting SFTP trigger..." -ForegroundColor Gray
     az rest --method post `
-      --url "https://management.azure.com/subscriptions/$((az account show --query id -o tsv))/resourceGroups/$resourceGroup/providers/Microsoft.Logic/workflows/$sftpLogicAppName/triggers/When_files_are_added_or_modified/run?api-version=2016-06-01" `
+      --url "https://management.azure.com/subscriptions/$Subscription/resourceGroups/$resourceGroup/providers/Microsoft.Logic/workflows/$sftpLogicAppName/triggers/When_files_are_added_or_modified/run?api-version=2016-06-01" `
       2>$null
     if ($LASTEXITCODE -eq 0) {
         Write-Host "SFTP trigger restarted." -ForegroundColor Green
@@ -177,15 +235,15 @@ Write-Host "`n=== Deploying Web App code ===" -ForegroundColor Cyan
 
 # Ensure the Web App is started before deploying
 Write-Host "Starting Web App..." -ForegroundColor Gray
-az webapp start --resource-group $resourceGroup --name $webAppName 2>$null
+az webapp start --subscription $Subscription --resource-group $resourceGroup --name $webAppName 2>$null
 
 # Verify the app is actually running (QuotaExceeded on Free tier can block deploys)
-$appState = az webapp show --resource-group $resourceGroup --name $webAppName --query "state" -o tsv
+$appState = az webapp show --subscription $Subscription --resource-group $resourceGroup --name $webAppName --query "state" -o tsv
 if ($appState -ne "Running") {
     Write-Host "Web App state is '$appState'. Attempting restart..." -ForegroundColor Yellow
-    az webapp restart --resource-group $resourceGroup --name $webAppName 2>$null
+    az webapp restart --subscription $Subscription --resource-group $resourceGroup --name $webAppName 2>$null
     Start-Sleep -Seconds 10
-    $appState = az webapp show --resource-group $resourceGroup --name $webAppName --query "state" -o tsv
+    $appState = az webapp show --subscription $Subscription --resource-group $resourceGroup --name $webAppName --query "state" -o tsv
     if ($appState -ne "Running") {
         Write-Host "Web App still not running (state: $appState). Deployment will likely fail." -ForegroundColor Red
         Write-Host "If on Free tier (F1), the daily quota may be exceeded. Scale to B1 or wait for reset." -ForegroundColor Yellow
@@ -206,6 +264,7 @@ Compress-Archive -Path @(
 
 # Use --async to avoid blocking on slow site startup
 az webapp deploy `
+  --subscription $Subscription `
   --resource-group $resourceGroup `
   --name $webAppName `
   --src-path $zipPath `
@@ -223,29 +282,47 @@ Write-Host "`n=== Ensuring required app settings ===" -ForegroundColor Cyan
 
 # Discover resource endpoints from resource group
 $storageAccount = az resource list -g $resourceGroup `
-  --query "[?type=='Microsoft.Storage/StorageAccounts' && !starts_with(name, 'sftp')].name | [0]" -o tsv
+  --subscription $Subscription `
+  --query "[?type=='Microsoft.Storage/storageAccounts' && !starts_with(name, 'sftp')].name | [0]" -o tsv
 
 $sbNamespace = az resource list -g $resourceGroup `
+  --subscription $Subscription `
   --query "[?type=='Microsoft.ServiceBus/namespaces'].name | [0]" -o tsv
 
 $cosmosAccount = az resource list -g $resourceGroup `
+  --subscription $Subscription `
   --query "[?type=='Microsoft.DocumentDB/databaseAccounts'].name | [0]" -o tsv
 
 $diAccount = az resource list -g $resourceGroup `
+  --subscription $Subscription `
   --query "[?type=='Microsoft.CognitiveServices/accounts' && starts_with(name, 'di-')].name | [0]" -o tsv
 
-# Read AI endpoint from local .env01 (not discoverable from Azure resources)
-$aiEndpoint = ""
-$aiModel = "gpt-4o"
-if (Test-Path ".env01") {
-    $envLines = Get-Content ".env01"
-    $match = $envLines | Where-Object { $_ -match '^AZURE_AI_PROJECT_ENDPOINT=' }
-    if ($match) { $aiEndpoint = ($match -split '=', 2)[1] }
-    $modelMatch = $envLines | Where-Object { $_ -match '^AZURE_AI_MODEL_DEPLOYMENT_NAME=' }
-    if ($modelMatch) { $aiModel = ($modelMatch -split '=', 2)[1] }
+$requiredDiscoveredResources = @{
+    "Storage account" = $storageAccount
+    "Service Bus namespace" = $sbNamespace
+    "Cosmos DB account" = $cosmosAccount
+    "Document Intelligence account" = $diAccount
 }
 
+foreach ($resourceName in $requiredDiscoveredResources.Keys) {
+    if ([string]::IsNullOrWhiteSpace($requiredDiscoveredResources[$resourceName])) {
+        Write-Host "Failed to discover $resourceName in resource group '$resourceGroup' for subscription '$Subscription'." -ForegroundColor Red
+        Write-Host "Aborting before writing app settings to avoid deploying malformed endpoint URLs." -ForegroundColor Yellow
+        exit 1
+    }
+}
+
+Write-Host "Discovered storage account: $storageAccount" -ForegroundColor Gray
+Write-Host "Discovered Service Bus namespace: $sbNamespace" -ForegroundColor Gray
+Write-Host "Discovered Cosmos DB account: $cosmosAccount" -ForegroundColor Gray
+Write-Host "Discovered Document Intelligence account: $diAccount" -ForegroundColor Gray
+
+# Read AI endpoint from .env01 (not discoverable from Azure resources)
+$aiEndpoint = $env:AZURE_AI_PROJECT_ENDPOINT
+$aiModel = if ($env:AZURE_AI_MODEL_DEPLOYMENT_NAME) { $env:AZURE_AI_MODEL_DEPLOYMENT_NAME } else { "gpt-4o" }
+
 az webapp config appsettings set `
+  --subscription $Subscription `
   --resource-group $resourceGroup `
   --name $webAppName `
   --settings `
@@ -275,13 +352,15 @@ if ($LASTEXITCODE -eq 0) {
 Write-Host "`n=== Ensuring RBAC for webapp ===" -ForegroundColor Cyan
 
 $webAppPrincipalId = az webapp identity show `
+  --subscription $Subscription `
   --resource-group $resourceGroup `
   --name $webAppName `
   --query principalId -o tsv
 
-$kvId = az keyvault show --name $keyVaultName --query id -o tsv
+$kvId = az keyvault show --subscription $Subscription --name $keyVaultName --query id -o tsv
 
 az role assignment create `
+  --subscription $Subscription `
   --role "Key Vault Secrets User" `
   --assignee-object-id $webAppPrincipalId `
   --assignee-principal-type ServicePrincipal `
@@ -291,15 +370,57 @@ Write-Host "Key Vault Secrets User role ensured." -ForegroundColor Gray
 
 # Agent needs to SEND messages to triage-complete, discarded, human-review, archival-pending
 $sbId = az resource list -g $resourceGroup `
+  --subscription $Subscription `
   --query "[?type=='Microsoft.ServiceBus/namespaces'].id | [0]" -o tsv
 
 az role assignment create `
+  --subscription $Subscription `
   --role "Azure Service Bus Data Sender" `
   --assignee-object-id $webAppPrincipalId `
   --assignee-principal-type ServicePrincipal `
   --scope $sbId 2>$null
 
 Write-Host "Service Bus Data Sender role ensured." -ForegroundColor Gray
+
+# Agent needs to CALL Document Intelligence (Cognitive Services User)
+$diId = az resource list -g $resourceGroup `
+  --subscription $Subscription `
+  --query "[?type=='Microsoft.CognitiveServices/accounts' && name=='$diAccount'].id | [0]" -o tsv
+
+if ($diId) {
+  az role assignment create `
+    --subscription $Subscription `
+    --role "Cognitive Services User" `
+    --assignee-object-id $webAppPrincipalId `
+    --assignee-principal-type ServicePrincipal `
+    --scope $diId 2>$null
+
+  Write-Host "Cognitive Services User role ensured on $diAccount." -ForegroundColor Gray
+} else {
+  Write-Warning "Document Intelligence account '$diAccount' not found; skipping role assignment."
+}
+
+# Agent needs to WRITE blobs (link-download tool uploads downloaded files
+# into the 'attachments' container). Reader is not enough — Contributor
+# is required for PUT/upload operations on the data plane.
+$saId = az storage account show `
+  --subscription $Subscription `
+  --resource-group $resourceGroup `
+  --name $storageAccount `
+  --query id -o tsv
+
+if ($saId) {
+  az role assignment create `
+    --subscription $Subscription `
+    --role "Storage Blob Data Contributor" `
+    --assignee-object-id $webAppPrincipalId `
+    --assignee-principal-type ServicePrincipal `
+    --scope $saId 2>$null
+
+  Write-Host "Storage Blob Data Contributor role ensured on $storageAccount." -ForegroundColor Gray
+} else {
+  Write-Warning "Storage account '$storageAccount' not found; skipping role assignment."
+}
 
 Write-Host "`n=== Deployment complete ===" -ForegroundColor Green
 Write-Host "Logic App: $logicAppName"

@@ -157,6 +157,8 @@ Thumbs.db
 
 # Local development
 *.local
+*.tmp
+.env*
 
 # Documentation (internal/private)
 docs/

@@ -46,7 +46,7 @@
           "method": "GET",
           "uri": "https://graph.microsoft.com/v1.0/users/@{parameters('monitoredMailbox')}/messages",
           "queries": {
-            "$filter": "isRead eq false or receivedDateTime ge @{formatDateTime(addHours(utcNow(), -1), 'yyyy-MM-ddTHH:mm:ssZ')}",
+            "$filter": "isRead eq false",
             "$top": "25",
             "$expand": "attachments",
             "$select": "id,from,subject,body,bodyPreview,receivedDateTime,hasAttachments",
@@ -61,7 +61,7 @@
             "secret": "@parameters('graphClientSecret')"
           }
         },
-        "description": "Fetches unread emails plus recently-received emails (last 1 hour) from the monitored mailbox via Graph API. The time-based safety net ensures emails auto-marked as read by Outlook Web are not missed. A Cosmos pre-check inside the loop skips already-processed emails."
+        "description": "Fetches unread emails from the monitored mailbox via Graph API. Processed emails are marked as read, and a Cosmos pre-check skips already-processed emails while their records exist."
       },
       "For_each_message": {
         "foreach": "@body('HTTP_Get_Unread_Messages')?['value']",
@@ -131,7 +131,7 @@
                 "maxItemCount": 1
               }
             },
-            "description": "Pre-check: query Cosmos by message ID to skip already-processed emails. This enables the time-based filter safety net without re-processing."
+            "description": "Pre-check: query Cosmos by message ID to skip already-processed emails."
           },
           "If_not_already_processed": {
             "runAfter": {

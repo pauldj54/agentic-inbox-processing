@@ -203,6 +203,33 @@
                                             <span class="px-2 py-1 text-xs font-medium rounded-full status-{{ display_status }}">
                                                 {{ display_status|upper }}
                                             </span>
+                                            {% set warnings = email.processingWarnings or ([email.processingWarning] if email.processingWarning else []) %}
+                                            {% if warnings %}
+                                            {# Build a concise multi-line tooltip: "<type>: <message>" per warning #}
+                                            {% set tooltip_lines = [] %}
+                                            {% for w in warnings %}
+                                                {% set _ = tooltip_lines.append((w.type or 'warning') ~ ': ' ~ (w.message or '')) %}
+                                                {% if w.details and w.details.error %}
+                                                    {% set _ = tooltip_lines.append('  ↳ ' ~ w.details.error) %}
+                                                {% endif %}
+                                                {% if w.details and w.details.failures %}
+                                                    {% for f in w.details.failures %}
+                                                        {% set _ = tooltip_lines.append('  ↳ ' ~ (f.filename or f.path or '') ~ ': ' ~ (f.error or '')) %}
+                                                    {% endfor %}
+                                                {% endif %}
+                                            {% endfor %}
+                                            <span class="relative group inline-flex items-center cursor-help"
+                                                  title="{{ tooltip_lines|join('\n') }}"
+                                                  aria-label="Processed with errors">
+                                                <span class="px-2 py-0.5 text-xs font-medium rounded-full status-failed inline-flex items-center gap-1">
+                                                    ⚠️ {{ warnings|length }} error{% if warnings|length > 1 %}s{% endif %}
+                                                </span>
+                                                <span class="hidden group-hover:block absolute left-0 top-full mt-1 z-20 w-80 p-2 text-xs text-white bg-gray-900 rounded shadow-lg whitespace-pre-wrap break-words">
+                                                    <strong class="block mb-1 text-red-300">Processing errors</strong>
+                                                    {{ tooltip_lines|join('\n') }}
+                                                </span>
+                                            </span>
+                                            {% endif %}
                                             {% if email.isDuplicate %}
                                             <span class="px-2 py-0.5 text-xs font-medium rounded-full badge-duplicate">
                                                 🔁 DUPLICATE

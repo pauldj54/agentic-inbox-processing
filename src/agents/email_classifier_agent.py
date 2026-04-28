@@ -44,6 +44,23 @@ from .tools.link_download_tool import LinkDownloadTool
 logger = logging.getLogger(__name__)
 
 
+EVENT_CATEGORY_KEYWORDS = [
+    ("Capital Call", ["capital call", "appel de fonds", "drawdown"]),
+    ("Distribution Notice", ["distribution notice", "redistribution notice", "distribution"]),
+    ("Tax Statement", ["tax statement", "tax", "k-1", "k1"]),
+    ("Subscription Agreement", ["subscription agreement", "subscription"]),
+    ("Capital Account Statement", ["capital account", "nav", "statement of account"]),
+    ("Quarterly Report", ["quarterly report", "quarterly"]),
+    ("Annual Financial Statement", ["annual financial", "annual report", "financial statement"]),
+    ("Legal Notice", ["legal notice", "notice to investors"]),
+    ("Extension Notice", ["extension notice", "extension"]),
+    ("Dissolution Notice", ["dissolution notice", "dissolution", "liquidation"]),
+]
+
+
+MISSING_FIELD_VALUES = {"", "unknown", "none", "null", "n/a", "not found"}
+
+
 def parse_bool(value: Union[str, bool, None]) -> bool:
     """
     Parse a value that might be a string boolean (from Logic App) to actual boolean.
@@ -115,6 +132,9 @@ class EmailClassificationAgent:
         
         # Pipeline mode configuration
         self.pipeline_mode = os.getenv("PIPELINE_MODE", "full")
+        self.relevance_timeout_seconds = int(os.getenv("RELEVANCE_CHECK_TIMEOUT_SECONDS", "90"))
+        self.classification_timeout_seconds = int(os.getenv("CLASSIFICATION_TIMEOUT_SECONDS", "180"))
+        self.document_events_timeout_seconds = int(os.getenv("DOCUMENT_EVENTS_TIMEOUT_SECONDS", "180"))
         
         # Agent instances (created on demand)
         self._relevance_agent = None
@@ -147,6 +167,63 @@ class EmailClassificationAgent:
             instructions=DOCUMENT_EVENTS_SYSTEM_PROMPT,
             response_format={"type": "json_object"}
         )
+
+    async def _run_agent_call_with_timeout(
+        self,
+        call_name: str,
+        email_id: str,
+        timeout_seconds: int,
+        coroutine_func,
+        *args,
+        **kwargs,
+    ):
+        """Run an async agent SDK wrapper in a worker thread with a timeout."""
+        def run_coroutine():
+            return asyncio.run(coroutine_func(*args, **kwargs))
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(run_coroutine),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            message = f"{call_name} timed out after {timeout_seconds}s for {email_id[:30]}"
+            logger.error(message)
+            raise TimeoutError(message) from exc
+
+    def _deterministic_relevance_check(self, email_data: dict) -> Optional[dict]:
+        """Return a relevance result when filenames/subject clearly identify a PE document."""
+        subject = str(email_data.get("subject", ""))
+        attachment_paths = email_data.get("attachmentPaths", []) or email_data.get("attachmentNames", [])
+        names = []
+        for entry in attachment_paths:
+            path = entry.get("originalName") or entry.get("path") if isinstance(entry, dict) else entry
+            if path:
+                names.append(str(path).split("/")[-1])
+
+        evidence_text = " ".join([subject, *names]).lower().replace("_", " ").replace("-", " ")
+        for category, keywords in EVENT_CATEGORY_KEYWORDS:
+            if any(keyword in evidence_text for keyword in keywords):
+                return {
+                    "is_relevant": True,
+                    "confidence": 0.98,
+                    "reasoning": f"Deterministic relevance from subject/attachment name evidence: {', '.join(names) or subject}",
+                    "initial_category": category,
+                    "deterministic": True,
+                }
+
+        has_pe_indicator = " pe " in f" {evidence_text} " or "private equity" in evidence_text
+        has_document = parse_bool(email_data.get("hasAttachments", False)) or bool(attachment_paths)
+        if has_pe_indicator and has_document:
+            return {
+                "is_relevant": True,
+                "confidence": 0.9,
+                "reasoning": "Deterministic relevance from PE indicator plus stored document attachment.",
+                "initial_category": "Others",
+                "deterministic": True,
+            }
+
+        return None
     
     async def process_next_email(self) -> Optional[dict]:
         """
@@ -155,15 +232,13 @@ class EmailClassificationAgent:
         Returns:
             Processing result dictionary or None if no emails available
         """
-        logger.info("Checking for emails in intake queue...")
-        
-        # Step 0: Get email from queue
-        email_message = self.queue_tools.receive_email_from_intake(max_wait_seconds=10)
-        
-        if not email_message:
-            logger.info("No emails to process")
-            return None
-        
+        return await self.queue_tools.process_email_from_intake(
+            self._process_received_email,
+            max_wait_seconds=10,
+        )
+
+    async def _process_received_email(self, email_message: dict) -> dict:
+        """Process one already-received Service Bus message body."""
         email_data = email_message.get("body", {})
 
         # Detect intake source: "sftp" for SFTP-sourced files, default to "email"
@@ -201,7 +276,20 @@ class EmailClassificationAgent:
                 }
                 logger.info("SFTP source → auto-relevant, skipping relevance check")
             else:
-                relevance_result = await self._check_relevance(email_data)
+                relevance_result = self._deterministic_relevance_check(email_data)
+                if relevance_result:
+                    logger.info(
+                        f"Deterministic relevance check matched: "
+                        f"{relevance_result.get('initial_category')}"
+                    )
+                else:
+                    relevance_result = await self._run_agent_call_with_timeout(
+                        "relevance check",
+                        email_id,
+                        self.relevance_timeout_seconds,
+                        self._check_relevance,
+                        email_data,
+                    )
             
             # OVERRIDE: If subject contains "PE" and (has attachments OR body mentions docs), force relevance
             # This handles cases where the model incorrectly marks PE emails as not relevant
@@ -414,6 +502,16 @@ class EmailClassificationAgent:
             # STEP 2: PROCESS ATTACHMENTS (for PE-relevant emails)
             # =====================================================
             attachment_analysis = await self._process_attachments(email_data)
+            attachment_paths = email_data.get("attachmentPaths") or []
+            expected_attachment_count = len(attachment_paths)
+            if expected_attachment_count == 0:
+                raw_count = email_data.get("attachmentsCount", email_data.get("attachmentCount", 0))
+                try:
+                    expected_attachment_count = int(raw_count or 0)
+                except (TypeError, ValueError):
+                    expected_attachment_count = 0
+            attachment_processing_errors = email_data.get("_attachment_processing_errors", [])
+            attachment_processing_failed = expected_attachment_count > 0 and not attachment_analysis
             
             # Log attachment processing
             if attachment_analysis:
@@ -421,6 +519,20 @@ class EmailClassificationAgent:
                     email_id=email_id,
                     event_type="attachments_processed",
                     details={"attachment_count": len(attachment_analysis)}
+                )
+            elif attachment_processing_failed:
+                self.cosmos_tools.log_classification_event(
+                    email_id=email_id,
+                    event_type="attachments_processing_failed",
+                    details={
+                        "expected_attachment_count": expected_attachment_count,
+                        "attachment_paths": [
+                            entry.get("path") if isinstance(entry, dict) else entry
+                            for entry in attachment_paths
+                        ],
+                        "error_count": len(attachment_processing_errors),
+                        "errors": attachment_processing_errors,
+                    }
                 )
             
             # =====================================================
@@ -492,14 +604,64 @@ class EmailClassificationAgent:
                     email_data=email_data,
                 )
 
+                if attachment_processing_failed:
+                    self.cosmos_tools.mark_processing_warning(
+                        email_id=email_id,
+                        warning_type="attachment_processing_failed",
+                        message="Attachments were stored but could not be downloaded or analyzed; PE event extraction was skipped.",
+                        details={
+                            "expected_attachment_count": expected_attachment_count,
+                            "error_count": len(attachment_processing_errors),
+                            "errors": attachment_processing_errors,
+                        },
+                    )
+
+                # ── STORE EXTRACTED CONTENT (triage-only) ──
+                # Persist DI extraction (or failure markers) to Cosmos so
+                # silent failures cannot hide. Without this we have zero
+                # production visibility into what DI returned for each blob.
+                for att in attachment_analysis:
+                    try:
+                        self.cosmos_tools.store_extracted_content(
+                            email_id=email_id,
+                            attachment_name=att.get("name", "unknown"),
+                            extracted_content=att.get("extracted_content", {}),
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to persist extracted content for {att.get('name')}: {e}",
+                            exc_info=True,
+                        )
+
+                # ── SURFACE DI / EXTRACTION FAILURES TO EMAIL RECORD ──
+                di_failures = [
+                    err for err in (email_data.get("_attachment_processing_errors") or [])
+                    if err.get("stage") == "di_extract"
+                ]
+                if di_failures:
+                    self.cosmos_tools.mark_processing_warning(
+                        email_id=email_id,
+                        warning_type="document_intelligence_failed",
+                        message=(
+                            f"{len(di_failures)} attachment(s) failed Document Intelligence "
+                            f"extraction; downstream PE events will be flagged needs_attention."
+                        ),
+                        details={"failures": di_failures},
+                    )
+
                 # ── PE EVENT UPSERT (triage-only, per-document) ──
                 # Extract per-document event attributes using the LLM,
                 # then create/update a PE event record for each document.
                 initial_cat = relevance_result.get("initial_category", "")
                 if initial_cat and initial_cat != NON_PE_CATEGORY:
                     try:
-                        per_doc_events = await self._extract_document_events(
-                            attachment_analysis, initial_category=initial_cat
+                        per_doc_events = await self._run_agent_call_with_timeout(
+                            "document event extraction",
+                            email_id,
+                            self.document_events_timeout_seconds,
+                            self._extract_document_events,
+                            attachment_analysis,
+                            initial_category=initial_cat,
                         )
                         for doc_event in per_doc_events:
                             try:
@@ -515,11 +677,27 @@ class EmailClassificationAgent:
                                     f"'{doc_event.get('document_name', '?')}': {pe_event_id} (triage-only)"
                                 )
                             except Exception as e:
-                                logger.warning(
-                                    f"Failed to upsert PE event for '{doc_event.get('document_name', '?')}': {e}"
+                                logger.error(
+                                    f"Failed to upsert PE event for '{doc_event.get('document_name', '?')}': {e}",
+                                    exc_info=True,
+                                )
+                                self.cosmos_tools.mark_processing_warning(
+                                    email_id=email_id,
+                                    warning_type="pe_event_upsert_failed",
+                                    message=f"Could not upsert PE event for '{doc_event.get('document_name', '?')}'",
+                                    details={"error": str(e), "error_type": type(e).__name__},
                                 )
                     except Exception as e:
-                        logger.warning(f"Failed per-document extraction in triage-only mode: {e}")
+                        logger.error(
+                            f"Failed per-document extraction in triage-only mode: {e}",
+                            exc_info=True,
+                        )
+                        self.cosmos_tools.mark_processing_warning(
+                            email_id=email_id,
+                            warning_type="document_event_extraction_failed",
+                            message="Per-document PE event extraction failed in triage-only mode",
+                            details={"error": str(e), "error_type": type(e).__name__},
+                        )
 
                 self.cosmos_tools.log_classification_event(
                     email_id=email_id,
@@ -546,7 +724,14 @@ class EmailClassificationAgent:
             # The confidence score from this step determines routing:
             # - confidence >= 65% → archival-pending queue
             # - confidence < 65%  → human-review queue
-            classification_result = await self._classify_email(email_data, attachment_analysis)
+            classification_result = await self._run_agent_call_with_timeout(
+                "classification",
+                email_id,
+                self.classification_timeout_seconds,
+                self._classify_email,
+                email_data,
+                attachment_analysis,
+            )
             
             # Log classification
             self.cosmos_tools.log_classification_event(
@@ -569,6 +754,18 @@ class EmailClassificationAgent:
                 step="final",
                 email_data=email_data
             )
+
+            if attachment_processing_failed:
+                self.cosmos_tools.mark_processing_warning(
+                    email_id=email_id,
+                    warning_type="attachment_processing_failed",
+                    message="Attachments were stored but could not be downloaded or analyzed; extracted content and PE event detail may be incomplete.",
+                    details={
+                        "expected_attachment_count": expected_attachment_count,
+                        "error_count": len(attachment_processing_errors),
+                        "errors": attachment_processing_errors,
+                    },
+                )
             
             # =====================================================
             # STEP 4a: PE EVENT DEDUPLICATION (per-document)
@@ -600,7 +797,16 @@ class EmailClassificationAgent:
                         else:
                             logger.info(f"New PE event created for '{doc_event.get('document_name', '?')}': {eid}")
                     except Exception as e:
-                        logger.warning(f"Failed to process PE event dedup for '{doc_event.get('document_name', '?')}': {e}")
+                        logger.error(
+                            f"Failed to process PE event dedup for '{doc_event.get('document_name', '?')}': {e}",
+                            exc_info=True,
+                        )
+                        self.cosmos_tools.mark_processing_warning(
+                            email_id=email_id,
+                            warning_type="pe_event_dedup_failed",
+                            message=f"Could not dedup PE event for '{doc_event.get('document_name', '?')}'",
+                            details={"error": str(e), "error_type": type(e).__name__},
+                        )
 
                 pe_event_id = pe_event_ids[0] if pe_event_ids else None
 
@@ -812,19 +1018,26 @@ class EmailClassificationAgent:
         if attachment_paths:
             attachment_count = max(attachment_count, len(attachment_paths))
         
+        email_data["_attachment_processing_errors"] = []
+
         if not has_attachments and attachment_count == 0:
             logger.info("No attachments to process")
             return []
         
         if not attachment_paths:
             logger.warning("hasAttachments is true but no attachmentPaths — nothing to download")
+            email_data["_attachment_processing_errors"].append({
+                "path": None,
+                "error": "hasAttachments is true but no attachmentPaths were provided",
+                "error_type": "MissingAttachmentPaths",
+            })
             return []
         
         logger.info(f"Processing {len(attachment_paths)} attachment(s) from blob storage...")
         
-        return await self._download_and_analyze_blobs(attachment_paths)
+        return await self._download_and_analyze_blobs(attachment_paths, email_data)
 
-    async def _download_and_analyze_blobs(self, attachment_paths: list) -> list:
+    async def _download_and_analyze_blobs(self, attachment_paths: list, email_data: dict | None = None) -> list:
         """
         Download attachments from blob storage and analyze with Document Intelligence.
         
@@ -837,6 +1050,12 @@ class EmailClassificationAgent:
         storage_url = os.environ.get("STORAGE_ACCOUNT_URL")
         if not storage_url:
             logger.error("STORAGE_ACCOUNT_URL not set — cannot read blobs")
+            if email_data is not None:
+                email_data.setdefault("_attachment_processing_errors", []).append({
+                    "path": None,
+                    "error": "STORAGE_ACCOUNT_URL not set — cannot read blobs",
+                    "error_type": "MissingStorageAccountUrl",
+                })
             return []
 
         results = []
@@ -848,17 +1067,53 @@ class EmailClassificationAgent:
                 container_client = blob_service.get_container_client("attachments")
                 for entry in attachment_paths:
                     blob_path = entry.get("path") if isinstance(entry, dict) else entry
-                    filename = blob_path.split("/")[-1] if "/" in blob_path else blob_path
+                    # Normalize: producers (notably the SFTP Logic App) sometimes
+                    # emit paths like "/attachments/{id}/{name}" — strip leading
+                    # slash and an optional "attachments/" prefix so the lookup
+                    # resolves inside the "attachments" container regardless of
+                    # which intake source produced the message.
+                    normalized_path = blob_path.lstrip("/") if blob_path else blob_path
+                    if normalized_path and normalized_path.startswith("attachments/"):
+                        normalized_path = normalized_path[len("attachments/"):]
+                    filename = normalized_path.split("/")[-1] if normalized_path and "/" in normalized_path else normalized_path
                     try:
-                        blob_client = container_client.get_blob_client(blob_path)
+                        blob_client = container_client.get_blob_client(normalized_path)
                         download = await blob_client.download_blob()
                         content_bytes = await download.readall()
-                        logger.info(f"Downloaded blob: {blob_path} ({len(content_bytes)} bytes)")
+                        logger.info(f"Downloaded blob: {normalized_path} (original: {blob_path}, {len(content_bytes)} bytes)")
 
                         extracted = await self.doc_intel_tool.analyze_document_from_bytes(
                             document_bytes=content_bytes,
                             filename=filename,
                         )
+                        # Surface Document Intelligence failures loudly — do NOT
+                        # let an empty/failed extraction silently degrade the
+                        # downstream extractor into producing all-Unknown events.
+                        if not extracted.get("success", False):
+                            di_error = extracted.get("error", "unknown DI failure")
+                            logger.error(
+                                f"Document Intelligence FAILED for {blob_path}: {di_error}"
+                            )
+                            if email_data is not None:
+                                email_data.setdefault("_attachment_processing_errors", []).append({
+                                    "path": blob_path,
+                                    "filename": filename,
+                                    "error": f"document_intelligence_failed: {di_error}",
+                                    "error_type": "DocumentIntelligenceFailure",
+                                    "stage": "di_extract",
+                                })
+                        elif not (extracted.get("content") or "").strip():
+                            logger.error(
+                                f"Document Intelligence returned EMPTY content for {blob_path}"
+                            )
+                            if email_data is not None:
+                                email_data.setdefault("_attachment_processing_errors", []).append({
+                                    "path": blob_path,
+                                    "filename": filename,
+                                    "error": "document_intelligence_returned_empty_text",
+                                    "error_type": "EmptyExtraction",
+                                    "stage": "di_extract",
+                                })
                         results.append({
                             "name": filename,
                             "size": len(content_bytes),
@@ -866,6 +1121,14 @@ class EmailClassificationAgent:
                         })
                     except Exception as e:
                         logger.error(f"Error processing blob {blob_path}: {e}", exc_info=True)
+                        if email_data is not None:
+                            email_data.setdefault("_attachment_processing_errors", []).append({
+                                "path": blob_path,
+                                "filename": filename,
+                                "error": str(e),
+                                "error_type": type(e).__name__,
+                                "stage": "blob_download",
+                            })
         finally:
             await credential.close()
 
@@ -905,7 +1168,7 @@ class EmailClassificationAgent:
             attachment_summary += f"Pages: {extracted.get('page_count', 0)}\n"
             attachment_summary += f"Tables found: {extracted.get('table_count', 0)}\n"
             attachment_summary += f"\n**Text content (first 1500 chars):**\n"
-            attachment_summary += extracted.get("full_text", "")[:1500]
+            attachment_summary += self._get_extracted_text(att)[:1500]
             
             # Add table summaries if present
             tables = extracted.get("tables", [])
@@ -1089,80 +1352,495 @@ class EmailClassificationAgent:
         if not attachment_analysis:
             return []
 
-        # Build per-document text for the prompt
-        docs_text = ""
+        events = []
         for att in attachment_analysis:
-            extracted = att.get("extracted_content", {})
-            docs_text += f"\n### Document: {att.get('name', 'unknown')}\n"
-            docs_text += f"Pages: {extracted.get('page_count', 0)}\n"
-            docs_text += f"\n**Text content (first 2000 chars):**\n"
-            docs_text += extracted.get("full_text", "")[:2000]
+            event = await self._extract_single_document_event(att, initial_category)
+            events.append(event)
 
-            tables = extracted.get("tables", [])
-            if tables:
-                docs_text += f"\n\n**Tables ({len(tables)} found):**\n"
-                for i, table in enumerate(tables[:3]):
-                    docs_text += f"\nTable {i+1} ({table.get('row_count')}x{table.get('column_count')}):\n"
-                    for row in table.get("rows", [])[:5]:
-                        docs_text += " | ".join(str(cell)[:30] for cell in row) + "\n"
+        logger.info(f"Extracted {len(events)} per-document events for {len(attachment_analysis)} attachment(s)")
+        return events
 
-            docs_text += "\n---\n"
-
-        user_prompt = DOCUMENT_EVENTS_USER_PROMPT.format(documents_text=docs_text)
-
-        if not self._doc_events_agent:
-            self._doc_events_agent = self._create_doc_events_agent()
-
-        run = self.agents_client.create_thread_and_process_run(
-            agent_id=self._doc_events_agent.id,
-            thread={"messages": [{"role": "user", "content": user_prompt}]}
-        )
-
-        messages = self.agents_client.messages.list(thread_id=run.thread_id)
-        for msg in messages:
-            if msg.role == "assistant":
-                for content in msg.content:
-                    if hasattr(content, 'text'):
-                        parsed = self._extract_json_from_response(content.text.value)
-                        if parsed and "pe_events" in parsed:
-                            logger.info(f"Extracted {len(parsed['pe_events'])} per-document events")
-                            return parsed["pe_events"]
-
-        # Fallback: one event per attachment with only the initial_category
-        logger.warning("Per-document extraction failed, falling back to one event per attachment")
-        return [
-            {
-                "document_name": att.get("name", "unknown"),
-                "category": initial_category,
-                "pe_company": "Unknown",
-                "fund_name": "Unknown",
-                "investor": "Zava Private Bank",
+    async def _extract_single_document_event(self, attachment: dict, initial_category: str) -> dict:
+        """Extract one PE event for one attachment, then enrich it deterministically."""
+        # Hard-fail loudly when upstream extraction failed or returned no text.
+        # Producing an all-Unknown event in this case is the silent-failure mode
+        # the user explicitly called out as bad design — surface it instead.
+        extracted_content = attachment.get("extracted_content") or {}
+        di_failed = extracted_content.get("success") is False
+        text = self._get_extracted_text(attachment)
+        if di_failed or not text.strip():
+            name = attachment.get("name", "unknown")
+            di_error = (
+                extracted_content.get("error")
+                if di_failed
+                else "empty_document_text"
+            )
+            logger.error(
+                f"Cannot extract PE event for {name}: "
+                f"{'di_failed' if di_failed else 'no text'} ({di_error})"
+            )
+            err_tag = (
+                f"di_extraction_failed: {di_error}" if di_failed
+                else "empty_document_text"
+            )
+            failed_event = {
+                "document_name": name,
+                "category": initial_category or "Unknown",
+                "pe_company": None,
+                "fund_name": None,
+                "investor": None,
                 "amount": None,
                 "due_date": None,
-                "confidence": 0.5,
+                "confidence": 0.0,
+                "extraction_method": "failed",
+                "validation_errors": [err_tag],
             }
-            for att in attachment_analysis
+            content_hash = attachment.get("contentMd5") or attachment.get("content_md5")
+            if content_hash:
+                failed_event["content_hash"] = content_hash
+            return failed_event
+
+        deterministic_event = self._extract_deterministic_document_event(attachment, initial_category)
+        llm_event = None
+
+        if self._is_deterministic_event_complete(deterministic_event):
+            logger.info(
+                "Deterministic extraction completed %s: category=%s fund=%s investor=%s amount=%s due_date=%s",
+                deterministic_event.get("document_name"),
+                deterministic_event.get("category"),
+                deterministic_event.get("fund_name"),
+                deterministic_event.get("investor"),
+                deterministic_event.get("amount"),
+                deterministic_event.get("due_date"),
+            )
+            deterministic_event.pop("_source_text", None)
+            return deterministic_event
+
+        try:
+            if not getattr(self, "_doc_events_agent", None):
+                self._doc_events_agent = self._create_doc_events_agent()
+
+            documents_text = self._build_document_events_text(attachment)
+            user_prompt = DOCUMENT_EVENTS_USER_PROMPT.format(documents_text=documents_text)
+            run = self.agents_client.create_thread_and_process_run(
+                agent_id=self._doc_events_agent.id,
+                thread={"messages": [{"role": "user", "content": user_prompt}]}
+            )
+
+            messages = self.agents_client.messages.list(thread_id=run.thread_id)
+            for msg in messages:
+                if msg.role == "assistant":
+                    for content in msg.content:
+                        if hasattr(content, 'text'):
+                            parsed = self._extract_json_from_response(content.text.value)
+                            if parsed and parsed.get("pe_events"):
+                                llm_event = parsed["pe_events"][0]
+                                break
+                    if llm_event:
+                        break
+        except Exception as e:
+            logger.warning(
+                f"LLM document extraction failed for {attachment.get('name', 'unknown')}: {e}",
+                exc_info=True,
+            )
+            llm_event = {"validation_errors": [f"llm_extraction_failed: {e}"]}
+
+        return self._merge_document_events(deterministic_event, llm_event or {})
+
+    def _build_document_events_text(self, attachment: dict) -> str:
+        """Build the document-event extraction prompt text for a single attachment."""
+        extracted = attachment.get("extracted_content", {})
+        docs_text = f"\n### Document: {attachment.get('name', 'unknown')}\n"
+        docs_text += f"Pages: {extracted.get('page_count', 0)}\n"
+        docs_text += f"\n**Text content:**\n"
+        docs_text += self._get_extracted_text(attachment)[:6000]
+
+        tables = extracted.get("tables", [])
+        if tables:
+            docs_text += f"\n\n**Tables ({len(tables)} found):**\n"
+            for i, table in enumerate(tables[:5]):
+                docs_text += f"\nTable {i+1} ({table.get('row_count')}x{table.get('column_count')}):\n"
+                for row in table.get("rows", [])[:10]:
+                    docs_text += " | ".join(str(cell)[:50] for cell in row) + "\n"
+
+        return docs_text + "\n---\n"
+
+    def _extract_deterministic_document_event(self, attachment: dict, initial_category: str = "Unknown") -> dict:
+        """Extract obvious labelled PE event fields from one document without using an LLM."""
+        name = attachment.get("name", "unknown")
+        text = self._get_extracted_text(attachment)
+        combined_text = f"{name}\n{text}"
+        category = self._infer_document_category(name, text) or initial_category or "Unknown"
+        fields = self._extract_common_document_fields(text)
+
+        event = {
+            "document_name": name,
+            "category": category,
+            "pe_company": fields.get("pe_company"),
+            "fund_name": fields.get("fund_name"),
+            "investor": fields.get("investor"),
+            "amount": fields.get("amount"),
+            "due_date": fields.get("due_date"),
+            "confidence": 0.75 if fields else 0.5,
+            "extraction_method": "deterministic_labels",
+        }
+        event.update({key: value for key, value in fields.items() if value is not None})
+
+        content_hash = attachment.get("contentMd5") or attachment.get("content_md5")
+        if content_hash:
+            event["content_hash"] = content_hash
+
+        if not self._has_meaningful_value(event.get("fund_name")):
+            inferred_fund = self._infer_fund_name_from_text(combined_text, category)
+            if inferred_fund:
+                event["fund_name"] = inferred_fund
+
+        # Stash the source text on the event so the merge step can ground LLM
+        # values against it. Stripped before persistence in `_merge_document_events`.
+        event["_source_text"] = combined_text
+
+        return event
+
+    def _get_extracted_text(self, attachment: dict) -> str:
+        """Return document text regardless of the exact extraction payload shape."""
+        extracted = attachment.get("extracted_content") or {}
+        candidates = [
+            extracted.get("full_text"),
+            extracted.get("content"),
+            extracted.get("text"),
+            attachment.get("full_text"),
+            attachment.get("content"),
+            attachment.get("text"),
         ]
+        summary = extracted.get("summary") if isinstance(extracted, dict) else None
+        if isinstance(summary, dict):
+            candidates.append(summary.get("first_500_chars"))
+
+        return "\n".join(str(value) for value in candidates if self._has_meaningful_value(value))
+
+    def _is_deterministic_event_complete(self, event: dict) -> bool:
+        """Return True when deterministic extraction has enough fields to skip LLM extraction."""
+        category = event.get("category")
+        if category == "Capital Call":
+            return not self._validate_document_event(event)
+        return all(
+            self._has_meaningful_value(event.get(field))
+            for field in ["category", "fund_name", "investor"]
+        )
+
+    def _extract_common_document_fields(self, text: str) -> dict:
+        """Extract labelled fields that commonly appear in PE notices."""
+        fields = {
+            "notice_date": self._extract_notice_date(text),
+            "investor": self._extract_label_value(text, ["Investor Name", "Investor", "Limited Partner", "LP Name"]),
+            "share_class": self._extract_label_value(text, ["Share Class"]),
+            "currency": self._extract_label_value(text, ["Currency"]),
+            "total_commitment": self._extract_money_label(text, ["Total Commitment"]),
+            "capital_called_with_notice": self._extract_money_label(text, ["Capital called with this notice"]),
+            "fund_level_amount_called": self._extract_money_label(text, ["Fund-level amount called", "Fund level amount called"]),
+            "investor_level_amount_called": self._extract_money_label(text, ["Investor-level amount called", "Investor level amount called"]),
+            "total_amount_due": self._extract_money_label(text, ["Total Amount Due", "Amount Due", "Total Due"]),
+            "relevant_amount": self._extract_money_label(text, ["Relevant Amount"]),
+            "value_date": self._extract_date_label(text, ["Value date", "Payment date", "Due date", "Settlement date"]),
+            "effective_date": self._extract_date_label(text, ["Effective Date", "Effective date"]),
+            "closing_date": self._extract_closing_date(text),
+            "reference": self._extract_label_value(text, ["Reference", "Payment Reference"]),
+        }
+
+        fields["due_date"] = (
+            fields.get("value_date")
+            or fields.get("effective_date")
+            or fields.get("closing_date")
+        )
+        fields["amount"] = (
+            fields.get("total_amount_due")
+            or fields.get("relevant_amount")
+            or fields.get("investor_level_amount_called")
+            or fields.get("capital_called_with_notice")
+            or fields.get("fund_level_amount_called")
+        )
+        fields["fund_name"] = self._extract_fund_name(text)
+        fields["pe_company"] = self._infer_pe_company(fields.get("fund_name"))
+        return {key: value for key, value in fields.items() if self._has_meaningful_value(value)}
+
+    def _merge_document_events(self, deterministic_event: dict, llm_event: dict) -> dict:
+        """Merge LLM and deterministic extraction, preferring deterministic labelled values.
+
+        After merging, every string-valued field is grounded against the source text:
+        if a value does not appear in the document, it is dropped (set to None) and
+        recorded in `validation_errors` so downstream code can flag the record as
+        needing attention rather than persist a hallucinated value.
+        """
+        merged = dict(llm_event or {})
+        for key, value in deterministic_event.items():
+            if self._has_meaningful_value(value) or not self._has_meaningful_value(merged.get(key)):
+                merged[key] = value
+
+        if not self._has_meaningful_value(merged.get("document_name")):
+            merged["document_name"] = deterministic_event.get("document_name", "unknown")
+
+        # Ground every extracted string against the source text. Only deterministic
+        # values (which came from regex on the source) are trusted unconditionally.
+        source_text = deterministic_event.get("_source_text") or ""
+        if source_text:
+            self._ground_event_against_source(merged, deterministic_event, source_text)
+
+        # Strip the private source-text marker before persisting / returning.
+        merged.pop("_source_text", None)
+
+        validation_errors = self._validate_document_event(merged)
+        # Preserve any grounding errors recorded above; do not overwrite them.
+        if validation_errors or merged.get("validation_errors"):
+            existing = list(merged.get("validation_errors") or [])
+            for tag in validation_errors:
+                if tag not in existing:
+                    existing.append(tag)
+            if existing:
+                merged["validation_errors"] = existing
+                merged["confidence"] = min(float(merged.get("confidence") or 0.5), 0.6)
+        return merged
+
+    # Fields that must be grounded in the source text (string-valued document content).
+    _GROUNDED_FIELDS = (
+        "investor",
+        "fund_name",
+        "pe_company",
+        "currency",
+        "share_class",
+        "reference",
+        "total_commitment",
+        "capital_called_with_notice",
+        "fund_level_amount_called",
+        "investor_level_amount_called",
+        "total_amount_due",
+        "amount",
+    )
+
+    def _ground_event_against_source(self, merged: dict, deterministic_event: dict, source_text: str) -> None:
+        """Drop any merged field that is not actually present in the source text.
+
+        Values that came from the deterministic regex extractor are trusted as-is
+        because they were already pulled from the source. Values that came from
+        the LLM (and don't match a deterministic value) must appear in the source
+        text or they are discarded as hallucinations.
+        """
+        normalized_source = self._normalize_for_grounding(source_text)
+        ungrounded = []
+        for field in self._GROUNDED_FIELDS:
+            value = merged.get(field)
+            if not self._has_meaningful_value(value):
+                continue
+            # Trust deterministic regex output unchanged.
+            if deterministic_event.get(field) == value:
+                continue
+            if self._value_appears_in_source(value, normalized_source):
+                continue
+            ungrounded.append(field)
+            merged[field] = None
+
+        if ungrounded:
+            existing = list(merged.get("validation_errors") or [])
+            for field in ungrounded:
+                tag = f"ungrounded_{field}"
+                if tag not in existing:
+                    existing.append(tag)
+            merged["validation_errors"] = existing
+
+    @staticmethod
+    def _normalize_for_grounding(text: str) -> str:
+        """Lowercase and collapse whitespace/punctuation for substring grounding checks."""
+        lowered = text.lower()
+        return re.sub(r"[\s,.\-/_]+", " ", lowered).strip()
+
+    def _value_appears_in_source(self, value, normalized_source: str) -> bool:
+        """True if the (normalized) value appears as a substring of the normalized source.
+
+        For amount-like strings ("305400.00 EUR") we also try the digit-only form.
+        """
+        s = self._normalize_for_grounding(str(value))
+        if not s:
+            return False
+        if s in normalized_source:
+            return True
+        digits = "".join(ch for ch in str(value) if ch.isdigit())
+        if digits and digits in re.sub(r"[^0-9]", "", normalized_source):
+            return True
+        return False
+
+    def _validate_document_event(self, event: dict) -> list[str]:
+        """Return validation gaps for event types where key fields are expected."""
+        category = event.get("category")
+        errors = []
+        if category == "Capital Call":
+            if not self._has_meaningful_value(event.get("fund_name")):
+                errors.append("missing_fund_name")
+            if not self._has_meaningful_value(event.get("investor")):
+                errors.append("missing_investor")
+            if not self._has_meaningful_value(event.get("amount")):
+                errors.append("missing_amount")
+            if not self._has_meaningful_value(event.get("due_date")):
+                errors.append("missing_due_date")
+        return errors
+
+    def _infer_document_category(self, document_name: str, text: str) -> str | None:
+        """Infer PE event category from attachment name and text."""
+        source = f"{document_name}\n{text}".lower()
+        for category, keywords in EVENT_CATEGORY_KEYWORDS:
+            if any(keyword in source for keyword in keywords):
+                return category
+        return None
+
+    def _extract_label_value(self, text: str, labels: list[str]) -> str | None:
+        """Extract the text following one of the provided labels.
+
+        Matches a label anywhere on a line (Document Intelligence often joins
+        two labelled fields onto a single line, e.g. ``Relevant Amount: 178.51
+        EUR Effective Date: 05/03/2026``). Capture stops at the next
+        ``<Capitalized Words>:`` label on the same line.
+        """
+        next_label_re = re.compile(r"\s+(?:[A-Z][A-Za-z0-9]*[- ]?){1,4}:\s")
+        for label in labels:
+            pattern = rf"(?i)\b{re.escape(label)}\s*:\s*([^\r\n]+)"
+            match = re.search(pattern, text)
+            if match:
+                value = match.group(1).strip()
+                cut = next_label_re.search(value)
+                if cut:
+                    value = value[: cut.start()].strip()
+                return value or None
+        return None
+
+    def _extract_money_label(self, text: str, labels: list[str]) -> str | None:
+        value = self._extract_label_value(text, labels)
+        return self._normalize_money(value) if value else None
+
+    def _extract_date_label(self, text: str, labels: list[str]) -> str | None:
+        value = self._extract_label_value(text, labels)
+        return self._normalize_date(value) if value else None
+
+    def _extract_notice_date(self, text: str) -> str | None:
+        # Match "<City>, DD/MM/YYYY" at the start of a line; allow trailing
+        # content (Document Intelligence sometimes joins the city/date with the
+        # fund header on the same line).
+        match = re.search(r"(?im)^\s*[A-Za-zÀ-ÿ .'-]+,\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b", text)
+        return self._normalize_date(match.group(1)) if match else None
+
+    def _extract_closing_date(self, text: str) -> str | None:
+        match = re.search(r"(?i)closing\s*#?\s*\d*\s*\((\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\)", text)
+        return self._normalize_date(match.group(1)) if match else None
+
+    def _extract_fund_name(self, text: str) -> str | None:
+        labels_value = self._extract_label_value(text, ["Fund", "Fund Name"])
+        if labels_value:
+            return self._clean_fund_name(labels_value)
+
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for line in lines[:12]:
+            if re.search(r"(?i)\bfund\b", line) and not re.search(
+                r"(?i)(amount|reference|commitment|level)", line
+            ):
+                cleaned = self._clean_fund_name(line)
+                if cleaned:
+                    return cleaned
+        return None
+
+    def _clean_fund_name(self, raw: str) -> str | None:
+        """Strip city/date prefix and document-type suffix from a fund header.
+
+        Handles inputs like ``Munich, 20/02/2026 ALPINE GROWTH PARTNERS FUND I -
+        REDISTRIBUTION NOTICE #1`` -> ``Alpine Growth Partners Fund I``.
+        """
+        if not raw:
+            return None
+        cleaned = raw.strip()
+        # Drop leading ``<City>, DD/MM/YYYY`` prefix.
+        cleaned = re.sub(
+            r"^[A-Za-zÀ-ÿ .'-]+,\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\s+",
+            "",
+            cleaned,
+        )
+        # Drop trailing document-type suffix (capital call, distribution,
+        # redistribution, tax statement, etc.) and anything after it.
+        cleaned = re.sub(
+            r"(?i)\s*[-–]?\s*(capital\s+call|redistribution|distribution|tax\s+statement|tax)\s+notice\b.*$",
+            "",
+            cleaned,
+        )
+        cleaned = re.sub(r"(?i)\s*[-–]?\s*tax\s+statement\b.*$", "", cleaned)
+        cleaned = cleaned.strip(" -–")
+        if not cleaned:
+            return None
+        # Title-case if the value is all caps so we get "Alpine Growth Partners
+        # Fund I" instead of "ALPINE GROWTH PARTNERS FUND I". The roman numeral
+        # is preserved by re-capitalising trailing single letters.
+        if cleaned.isupper():
+            titled = cleaned.title()
+            titled = re.sub(
+                r"\b(I{1,3}|IV|V|VI{0,3}|IX|X)\b",
+                lambda m: m.group(1).upper(),
+                titled,
+                flags=re.IGNORECASE,
+            )
+            return titled
+        return cleaned
+
+    def _infer_fund_name_from_text(self, text: str, category: str) -> str | None:
+        if category != "Capital Call":
+            return None
+        return self._extract_fund_name(text)
+
+    def _infer_pe_company(self, fund_name: str | None) -> str | None:
+        if not fund_name:
+            return None
+        match = re.match(r"(.+?)\s+Fund\b", fund_name, flags=re.IGNORECASE)
+        return match.group(1).strip() if match else None
+
+    def _normalize_money(self, value: str | None) -> str | None:
+        if not value:
+            return None
+        currency_match = re.search(r"\b([A-Z]{3})\b", value)
+        amount_match = re.search(r"([0-9][0-9\s,.]*)", value)
+        if not amount_match:
+            return value.strip()
+        number = amount_match.group(1).replace(" ", "").replace(",", "")
+        currency = currency_match.group(1) if currency_match else ""
+        return f"{number} {currency}".strip()
+
+    def _normalize_date(self, value: str | None) -> str | None:
+        if not value:
+            return None
+        match = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", value)
+        if not match:
+            return value.strip()
+        day, month, year = match.groups()
+        if len(year) == 2:
+            year = f"20{year}"
+        return f"{year}-{int(month):02d}-{int(day):02d}"
+
+    def _has_meaningful_value(self, value) -> bool:
+        if value is None:
+            return False
+        return str(value).strip().lower() not in MISSING_FIELD_VALUES
 
     def cleanup(self):
         """Clean up agent resources."""
         if self._relevance_agent:
             try:
                 self.agents_client.delete_agent(self._relevance_agent.id)
-            except:
-                pass
-        
+            except Exception as e:
+                logger.warning(f"Failed to delete relevance agent: {e}", exc_info=True)
+
         if self._classification_agent:
             try:
                 self.agents_client.delete_agent(self._classification_agent.id)
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to delete classification agent: {e}", exc_info=True)
 
         if self._doc_events_agent:
             try:
                 self.agents_client.delete_agent(self._doc_events_agent.id)
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to delete doc-events agent: {e}", exc_info=True)
 
 
 async def run_agent_loop(max_iterations: int = 10, wait_seconds: int = 30):
@@ -1189,7 +1867,7 @@ async def run_agent_loop(max_iterations: int = 10, wait_seconds: int = 30):
                     await asyncio.sleep(wait_seconds)
                     
             except Exception as e:
-                logger.error(f"Error in processing loop: {e}")
+                logger.error(f"Error in processing loop: {e}", exc_info=True)
                 await asyncio.sleep(5)  # Brief pause before retry
                 
     finally:

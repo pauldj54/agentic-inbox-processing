@@ -5,13 +5,12 @@ Authentication via DefaultAzureCredential (managed identity, CLI, VS Code).
 """
 
 import os
-import json
 import logging
 from typing import Optional
 from datetime import datetime
 from azure.identity import DefaultAzureCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
-from azure.ai.documentintelligence.models import AnalyzeDocumentRequest, DocumentAnalysisFeature
+from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +56,7 @@ class DocumentIntelligenceTool:
             # Start the analysis with Layout model
             poller = self.client.begin_analyze_document(
                 model_id="prebuilt-layout",
-                analyze_request=AnalyzeDocumentRequest(url_source=document_url),
-                features=[DocumentAnalysisFeature.KEY_VALUE_PAIRS]
+                body=AnalyzeDocumentRequest(url_source=document_url),
             )
             
             # Wait for completion
@@ -92,9 +90,8 @@ class DocumentIntelligenceTool:
             # Start the analysis with Layout model
             poller = self.client.begin_analyze_document(
                 model_id="prebuilt-layout",
-                analyze_request=document_bytes,
+                body=document_bytes,
                 content_type="application/pdf",
-                features=[DocumentAnalysisFeature.KEY_VALUE_PAIRS]
             )
             
             # Wait for completion
@@ -123,12 +120,13 @@ class DocumentIntelligenceTool:
         Returns:
             Structured dictionary with extracted content
         """
-        # Extract full text content (limited for compact mode)
-        full_text = result.content if hasattr(result, 'content') else ""
+        content = result.content if hasattr(result, 'content') else ""
         
-        # In compact mode, limit text to first 3000 chars to reduce token usage
-        if compact and len(full_text) > 3000:
-            full_text = full_text[:3000] + "\n... [text truncated for processing]"
+        # In compact mode, limit text to first 8000 chars to reduce token usage
+        # while still preserving labelled fields that often live below the
+        # letterhead/header (investor name, currency, totals, value date, etc.).
+        if compact and len(content) > 8000:
+            content = content[:8000] + "\n... [text truncated for processing]"
         
         # Extract tables with structure (essential for PE document classification)
         tables = []
@@ -152,21 +150,16 @@ class DocumentIntelligenceTool:
         # Document summary
         page_count = len(result.pages) if hasattr(result, 'pages') else 0
         
-        # Compact output for classification - skip paragraphs and key-value pairs
+        # Compact output for classification: content text plus compact table rows only.
+        # Do not return layout geometry, spans, paragraphs, or key-value-pair payloads.
         return {
             "success": True,
             "source": source_reference,
             "analyzed_at": datetime.utcnow().isoformat(),
             "page_count": page_count,
-            "full_text": full_text,
+            "content": content,
             "tables": tables,
             "table_count": len(tables),
-            # Summary for quick access
-            "summary": {
-                "text_length": len(result.content) if hasattr(result, 'content') else 0,
-                "table_count": len(tables),
-                "first_500_chars": (result.content[:500] if hasattr(result, 'content') and result.content else "")
-            }
         }
     
     def _cells_to_rows(self, cells: list, row_count: int, column_count: int) -> list:
@@ -204,11 +197,10 @@ def get_document_intelligence_tool_definition() -> dict:
         "function": {
             "name": "process_document",
             "description": (
-                "Extracts text, tables, and key-value pairs from a PDF document using "
+                "Extracts compact text and table rows from a PDF document using "
                 "Azure Document Intelligence. Use this tool to analyze PDF attachments "
                 "from emails to understand their content for classification. Returns "
-                "structured data including full text, tables (with rows/columns), and "
-                "any detected key-value pairs."
+                "only the document content text and compact tables with rows/columns."
             ),
             "parameters": {
                 "type": "object",

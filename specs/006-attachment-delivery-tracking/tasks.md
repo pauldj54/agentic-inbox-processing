@@ -57,7 +57,7 @@
 - [x] T009 [US1] Update `Create_intake_record` Cosmos DB upsert action body (new record path) in `logic-apps/email-ingestion/workflow.json` — add fields: `contentHash` (primary attachment MD5), `version: 1`, `deliveryCount: 1`, `deliveryHistory` array with initial `{deliveredAt, contentHash, action: "new"}` entry, `lastDeliveredAt` set to `utcNow()` per contracts.md §2
 - [x] T010 [US1] Add `Patch_email_delivery_count` Cosmos DB patch action (duplicate path) in `logic-apps/email-ingestion/workflow.json` — increment `deliveryCount`, append `{deliveredAt, contentHash, action: "duplicate"}` to `deliveryHistory`, update `lastDeliveredAt` on the existing record per contracts.md §2 duplicate patch body
 - [x] T011 [US1] Add `Patch_email_content_update` Cosmos DB patch action (content update path) in `logic-apps/email-ingestion/workflow.json` — update `contentHash`, increment `version` and `deliveryCount`, append `{deliveredAt, contentHash, action: "update"}` to `deliveryHistory`, update `lastDeliveredAt` per contracts.md §2 content update patch body
-- [ ] T012 [US1] Deploy updated email Logic App workflow via `deploy_updates.ps1`
+- [X] T012 [US1] Deploy updated email Logic App workflow via `deploy_updates.ps1`
 
 **Checkpoint**: New email attachments create records with `version: 1`, `deliveryCount: 1`. Duplicate attachments (same hash, same partition) increment `deliveryCount`. Content update patch action wired but filename-matching refinement deferred to US4.
 
@@ -106,7 +106,7 @@
 - [x] T019 [US4] Refine `Handle_email_dedup` conditional in `logic-apps/email-ingestion/workflow.json` — when `Check_content_hash_dedup` returns 0 results, add a secondary filename-match query or extend the conditional to check for existing records with matching filename within the same partition, then route to `Patch_email_content_update` (T011) per FR-004
 - [x] T020 [US4] Add filename-based content update detection in link download dedup logic in `src/agents/tools/link_download_tool.py` — after `find_by_content_hash()` returns None, query for existing record with same filename in partition; if found with different hash, patch as content update (increment `version` + `deliveryCount`, `action: "update"`)
 - [x] T021 [P] [US4] Add unit test in `tests/unit/test_delivery_tracking.py` for content update version increment: test same-filename-different-hash increments version
-- [ ] T022 [US4] Deploy updated Logic App and webapp via `deploy_updates.ps1`
+- [X] T022 [US4] Deploy updated Logic App and webapp via `deploy_updates.ps1`
 
 **Checkpoint**: Same-filename-different-content documents correctly increment `version`. Both Logic App and Python tool handle the update path.
 

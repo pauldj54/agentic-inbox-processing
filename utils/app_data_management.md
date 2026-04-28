@@ -122,10 +122,13 @@ All scripts live in the `utils/` directory and load credentials from `.env01` at
 
 | Script | Purpose | Usage |
 |---|---|---|
-| `factory_reset.py` | **Full factory reset** — deletes all documents from `intake-records`, `pe-events`, `audit-logs`, and `classifications`. Resets the dashboard to a clean state. | `python utils/factory_reset.py --dry-run` (preview) |
+| `factory_reset.py` | **Full factory reset** — pauses the Email Logic App, SFTP Logic App, and Web App; deletes all documents from `intake-records`, `pe-events`, `audit-logs`, and `classifications`; purges Service Bus queues; clears the `attachments` blob container; then starts the apps again. | `python utils/factory_reset.py --dry-run` (preview) |
 | | | `python utils/factory_reset.py` (interactive confirm) |
 | | | `python utils/factory_reset.py --yes` (skip prompt) |
 | | | `python utils/factory_reset.py --container pe-events` (single container) |
+| | | `python utils/factory_reset.py --leave-stopped` (reset data but keep apps stopped) |
+| | | `python utils/factory_reset.py --skip-app-control` (do not pause/start apps) |
+| | | `python utils/factory_reset.py --skip-storage` (do not clear blobs) |
 | `purge_queues.py` | Drain all Service Bus queues (`intake`, `discarded`, `human-review`, `archival-pending`, `triage-complete`). | `python utils/purge_queues.py --dry-run` |
 | `cleanup_pe_events.py` | Delete all documents from `pe-events` only. | `python utils/cleanup_pe_events.py` |
 | `cleanup_orphans.py` | Remove orphan documents (no `status` field) from the legacy `emails` container. | `python utils/cleanup_orphans.py` |
@@ -160,17 +163,14 @@ All scripts live in the `utils/` directory and load credentials from `.env01` at
 To fully reset the application to a clean state:
 
 ```bash
-# 1. Preview what will be deleted
+# 1. Preview what will be paused/deleted/restarted
 python utils/factory_reset.py --dry-run
 
-# 2. Clear all Cosmos DB containers
+# 2. Pause apps, clear Cosmos DB, queues, and blob attachments, then restart apps
 python utils/factory_reset.py --yes
 
-# 3. Drain all Service Bus queues
-python utils/purge_queues.py
-
-# 4. Verify clean state
+# 3. Verify clean state
 python utils/diagnose.py
 ```
 
-After reset, send a test email or SFTP file to verify the pipeline processes correctly and the dashboard populates with fresh data.
+After reset, send a new unread test email or SFTP file to verify the pipeline processes correctly and the dashboard populates with fresh data.
