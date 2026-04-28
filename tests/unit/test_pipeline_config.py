@@ -41,6 +41,23 @@ class TestPipelineModeRouting:
             "reasoning": "Subject mentions capital call",
         }
 
+    def test_deterministic_relevance_detects_capital_call_attachment(self):
+        from src.agents.email_classifier_agent import EmailClassificationAgent
+
+        agent = EmailClassificationAgent.__new__(EmailClassificationAgent)
+        result = agent._deterministic_relevance_check({
+            "subject": "Your PE Doc",
+            "hasAttachments": True,
+            "attachmentPaths": [
+                {"path": "message-id/Fictitious_PE_Capital_Call_1.pdf", "source": "attachment"}
+            ],
+        })
+
+        assert result is not None
+        assert result["is_relevant"] is True
+        assert result["initial_category"] == "Capital Call"
+        assert result["deterministic"] is True
+
     def _build_classification_result(self) -> dict:
         """Build a successful classification result."""
         return {
@@ -51,6 +68,12 @@ class TestPipelineModeRouting:
             "reasoning": "Identified as capital call based on content",
             "key_evidence": ["capital call notice"],
         }
+
+    def _mock_queue_processor(self, agent, email_data: dict) -> None:
+        async def run_processor(processor, *args, **kwargs):
+            return await processor({"body": email_data})
+
+        agent.queue_tools.process_email_from_intake = AsyncMock(side_effect=run_processor)
 
     def _create_agent(self, pipeline_mode: str):
         """Create an EmailClassificationAgent with mocked dependencies.
@@ -94,10 +117,8 @@ class TestPipelineModeRouting:
         relevance_result = self._build_relevance_result()
         classification_result = self._build_classification_result()
 
-        # Mock queue receive to return our email
-        agent.queue_tools.receive_email_from_intake.return_value = {
-            "body": email_data,
-        }
+        # Mock queue processor to invoke the agent callback with our email
+        self._mock_queue_processor(agent, email_data)
         agent.queue_tools.QUEUE_EMAIL_INTAKE = "intake"
         agent.queue_tools.triage_queue = "triage-complete"
         agent.queue_tools.route_email.return_value = "archival-pending"
@@ -154,10 +175,8 @@ class TestPipelineModeRouting:
         email_data = self._build_email_data()
         relevance_result = self._build_relevance_result()
 
-        # Mock queue receive to return our email
-        agent.queue_tools.receive_email_from_intake.return_value = {
-            "body": email_data,
-        }
+        # Mock queue processor to invoke the agent callback with our email
+        self._mock_queue_processor(agent, email_data)
         agent.queue_tools.QUEUE_EMAIL_INTAKE = "intake"
         agent.queue_tools.triage_queue = "triage-complete"
         agent.queue_tools.send_to_triage_queue.return_value = "triage-complete"
@@ -176,6 +195,9 @@ class TestPipelineModeRouting:
         # Mock attachment processing
         agent._process_attachments = AsyncMock(return_value=[])
 
+        # Mock per-document event extraction (returns empty since no attachments)
+        agent._extract_document_events = AsyncMock(return_value=[])
+
         # Mock classification — should NOT be called
         agent._classify_email = AsyncMock(return_value={})
 
@@ -183,6 +205,9 @@ class TestPipelineModeRouting:
         agent.cosmos_tools.log_classification_event = MagicMock()
         agent.cosmos_tools.update_email_classification = MagicMock(return_value={})
         agent.cosmos_tools.get_email_document = MagicMock(return_value=None)
+        agent.cosmos_tools.find_or_create_pe_event = MagicMock(
+            return_value=({"id": "pe-event-1"}, False)
+        )
 
         result = await agent.process_next_email()
 

@@ -188,7 +188,7 @@
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Received At</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">From</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Subject</th>
-                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">📎</th>
+                                <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" title="Documents: 📎 email · 🔗 link · 📁 SFTP">📄</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Delivery</th>
                                 <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Preview</th>
                             </tr>
@@ -203,6 +203,33 @@
                                             <span class="px-2 py-1 text-xs font-medium rounded-full status-{{ display_status }}">
                                                 {{ display_status|upper }}
                                             </span>
+                                            {% set warnings = email.processingWarnings or ([email.processingWarning] if email.processingWarning else []) %}
+                                            {% if warnings %}
+                                            {# Build a concise multi-line tooltip: "<type>: <message>" per warning #}
+                                            {% set tooltip_lines = [] %}
+                                            {% for w in warnings %}
+                                                {% set _ = tooltip_lines.append((w.type or 'warning') ~ ': ' ~ (w.message or '')) %}
+                                                {% if w.details and w.details.error %}
+                                                    {% set _ = tooltip_lines.append('  ↳ ' ~ w.details.error) %}
+                                                {% endif %}
+                                                {% if w.details and w.details.failures %}
+                                                    {% for f in w.details.failures %}
+                                                        {% set _ = tooltip_lines.append('  ↳ ' ~ (f.filename or f.path or '') ~ ': ' ~ (f.error or '')) %}
+                                                    {% endfor %}
+                                                {% endif %}
+                                            {% endfor %}
+                                            <span class="relative group inline-flex items-center cursor-help"
+                                                  title="{{ tooltip_lines|join('\n') }}"
+                                                  aria-label="Processed with errors">
+                                                <span class="px-2 py-0.5 text-xs font-medium rounded-full status-failed inline-flex items-center gap-1">
+                                                    ⚠️ {{ warnings|length }} error{% if warnings|length > 1 %}s{% endif %}
+                                                </span>
+                                                <span class="hidden group-hover:block absolute left-0 top-full mt-1 z-20 w-80 p-2 text-xs text-white bg-gray-900 rounded shadow-lg whitespace-pre-wrap break-words">
+                                                    <strong class="block mb-1 text-red-300">Processing errors</strong>
+                                                    {{ tooltip_lines|join('\n') }}
+                                                </span>
+                                            </span>
+                                            {% endif %}
                                             {% if email.isDuplicate %}
                                             <span class="px-2 py-0.5 text-xs font-medium rounded-full badge-duplicate">
                                                 🔁 DUPLICATE
@@ -246,21 +273,52 @@
                                         {% endif %}
                                     </td>
                                     <td class="px-4 py-3 whitespace-nowrap text-sm text-center">
-                                        {% set att_count = email.attachmentsCount or 0 %}
+                                        {# ── Count documents by source ── #}
+                                        {% set attachments = (email.attachmentPaths or [])|normalize_attachments %}
+                                        {% set email_doc_count = attachments|selectattr('source', 'equalto', 'attachment')|list|length %}
+                                        {% set link_doc_count = attachments|selectattr('source', 'equalto', 'link')|list|length %}
+                                        {# Fallback: link count from linkDownload metadata #}
+                                        {% if link_doc_count == 0 %}
+                                            {% set link_doc_count = (email.linkDownload.downloaded_count if email.linkDownload and email.linkDownload.downloaded_count else 0)|int %}
+                                        {% endif %}
+                                        {# Fallback: email attachment count from aggregate fields #}
+                                        {% if email_doc_count == 0 and email.hasAttachments|parse_bool %}
+                                            {% set raw_att = (email.attachmentsCount or 0)|int %}
+                                            {% if raw_att > link_doc_count %}
+                                                {% set email_doc_count = raw_att - link_doc_count %}
+                                            {% elif link_doc_count == 0 and raw_att > 0 %}
+                                                {% set email_doc_count = raw_att %}
+                                            {% endif %}
+                                        {% endif %}
+                                        {# SFTP records always have one file #}
+                                        {% set sftp_doc_count = 1 if email.intakeSource == 'sftp' else 0 %}
+                                        {# Rejected / failed link counts #}
                                         {% set rejected = email.rejectedAttachments|default([])|list %}
                                         {% set rejected_count = rejected|length %}
                                         {% if email.linkDownload and email.linkDownload.failures %}
                                             {% set link_rejected_count = email.linkDownload.failures|selectattr('error_type', 'equalto', 'content_type_not_allowed')|list|length %}
+                                            {% set link_failed_count = email.linkDownload.failures|rejectattr('error_type', 'equalto', 'content_type_not_allowed')|list|length %}
                                         {% else %}
                                             {% set link_rejected_count = 0 %}
+                                            {% set link_failed_count = 0 %}
                                         {% endif %}
-                                        {% set link_dl_count = (email.linkDownload.downloaded_count if email.linkDownload and email.linkDownload.downloaded_count else 0)|int %}
-                                        {% set effective_att_count = att_count|int if att_count|int > 0 else link_dl_count %}
-                                        {% if email.hasAttachments|parse_bool or effective_att_count > 0 %}
-                                            {% set attachments = email.attachmentPaths|normalize_attachments %}
-                                            <span class="text-green-600" title="{{ effective_att_count }} attachment(s)">
-                                                ✅ {{ effective_att_count }}
-                                            </span>
+                                        {# Total successful documents #}
+                                        {% set total_docs = email_doc_count + link_doc_count + sftp_doc_count %}
+                                        {% if total_docs > 0 or link_failed_count > 0 %}
+                                            <div class="flex flex-col items-center gap-0.5">
+                                                {% if sftp_doc_count > 0 %}
+                                                    <span class="text-green-600" title="{{ sftp_doc_count }} SFTP file(s)">📁 {{ sftp_doc_count }}</span>
+                                                {% endif %}
+                                                {% if email_doc_count > 0 %}
+                                                    <span class="text-green-600" title="{{ email_doc_count }} email attachment(s)">📎 {{ email_doc_count }}</span>
+                                                {% endif %}
+                                                {% if link_doc_count > 0 %}
+                                                    <span class="text-green-600" title="{{ link_doc_count }} linked download(s)">🔗 {{ link_doc_count }}</span>
+                                                {% endif %}
+                                                {% if link_failed_count > 0 %}
+                                                    <span class="text-red-500" title="{{ link_failed_count }} download(s) failed">⚠️ {{ link_failed_count }} failed</span>
+                                                {% endif %}
+                                            </div>
                                         {% else %}
                                             <span class="text-gray-400">—</span>
                                         {% endif %}
@@ -402,14 +460,28 @@
                                 </div>
                                 {% endif %}
                                 
-                                {# Attachments indicator #}
-                                {% set att_count = msg.body.attachmentsCount or 0 %}
+                                {# Documents indicator (source-aware) #}
+                                {% set msg_attachments = (msg.body.attachmentPaths or email.attachmentPaths or [])|normalize_attachments %}
+                                {% set msg_email_docs = msg_attachments|selectattr('source', 'equalto', 'attachment')|list|length %}
+                                {% set msg_link_docs = msg_attachments|selectattr('source', 'equalto', 'link')|list|length %}
                                 {% set msg_link_dl = msg.body.linkDownload or email.linkDownload %}
-                                {% set msg_link_dl_count = (msg_link_dl.downloaded_count if msg_link_dl and msg_link_dl.downloaded_count else 0)|int %}
-                                {% set msg_effective_att = att_count|int if att_count|int > 0 else msg_link_dl_count %}
-                                {% if email.hasAttachments|parse_bool or msg.body.hasAttachments|parse_bool or msg_effective_att > 0 %}
-                                <div class="mt-1">
-                                    <span class="text-xs text-green-600">📎 {{ msg_effective_att }} attachment(s)</span>
+                                {% if msg_link_docs == 0 and msg_link_dl and msg_link_dl.downloaded_count %}
+                                    {% set msg_link_docs = msg_link_dl.downloaded_count|int %}
+                                {% endif %}
+                                {% if msg_email_docs == 0 and (email.hasAttachments|parse_bool or msg.body.hasAttachments|parse_bool) %}
+                                    {% set raw_msg_att = (msg.body.attachmentsCount or email.attachmentsCount or 0)|int %}
+                                    {% if raw_msg_att > msg_link_docs %}
+                                        {% set msg_email_docs = raw_msg_att - msg_link_docs %}
+                                    {% elif msg_link_docs == 0 and raw_msg_att > 0 %}
+                                        {% set msg_email_docs = raw_msg_att %}
+                                    {% endif %}
+                                {% endif %}
+                                {% set msg_is_sftp = (email.intakeSource == 'sftp' or msg.body.intakeSource == 'sftp') %}
+                                {% if msg_email_docs > 0 or msg_link_docs > 0 or msg_is_sftp %}
+                                <div class="mt-1 flex items-center gap-1">
+                                    {% if msg_is_sftp %}<span class="text-xs text-green-600">📁 1</span>{% endif %}
+                                    {% if msg_email_docs > 0 %}<span class="text-xs text-green-600">📎 {{ msg_email_docs }}</span>{% endif %}
+                                    {% if msg_link_docs > 0 %}<span class="text-xs text-green-600">🔗 {{ msg_link_docs }}</span>{% endif %}
                                 </div>
                                 {% endif %}
                             </div>

@@ -7,7 +7,7 @@ Uses DefaultAzureCredential for passwordless authentication.
 import os
 import json
 import logging
-from typing import Optional, List, Union
+from typing import Awaitable, Callable, Optional, List, Union
 from datetime import datetime
 from azure.identity import DefaultAzureCredential
 from azure.servicebus import ServiceBusClient, ServiceBusMessage
@@ -82,10 +82,92 @@ class QueueTools:
             fully_qualified_namespace=self.fully_qualified_namespace,
             credential=AsyncCredential()
         )
+
+    async def process_email_from_intake(
+        self,
+        processor: Callable[[dict], Awaitable[dict]],
+        max_wait_seconds: int = 30,
+        max_lock_renewal_seconds: int = 900,
+    ) -> Optional[dict]:
+        """
+        Receive one intake message, process it, then settle it.
+
+        The message is completed only after processor() returns successfully.
+        If processing raises, the message is abandoned so Service Bus can retry
+        or eventually dead-letter it according to queue policy.
+        """
+        from azure.identity.aio import DefaultAzureCredential as AsyncCredential
+
+        logger.info(f"Receiving message from {self.QUEUE_EMAIL_INTAKE}...")
+        credential = AsyncCredential()
+        client = AsyncServiceBusClient(
+            fully_qualified_namespace=self.fully_qualified_namespace,
+            credential=credential,
+        )
+
+        async with credential, client:
+            receiver = client.get_queue_receiver(
+                queue_name=self.QUEUE_EMAIL_INTAKE,
+                max_wait_time=max_wait_seconds,
+            )
+            async with receiver:
+                messages = await receiver.receive_messages(
+                    max_message_count=1,
+                    max_wait_time=max_wait_seconds,
+                )
+
+                if not messages:
+                    logger.info("No messages in intake queue")
+                    return None
+
+                msg = messages[0]
+                email_message = {
+                    "sequence_number": msg.sequence_number,
+                    "enqueued_time": msg.enqueued_time_utc.isoformat() if msg.enqueued_time_utc else None,
+                    "message_id": msg.message_id,
+                    "body": self._parse_message_body(str(msg)),
+                    "received_at": datetime.utcnow().isoformat(),
+                }
+
+                lock_renewer = None
+                try:
+                    try:
+                        from azure.servicebus.aio import AutoLockRenewer
+
+                        lock_renewer = AutoLockRenewer(
+                            max_lock_renewal_duration=max_lock_renewal_seconds
+                        )
+                        await lock_renewer.__aenter__()
+                        lock_renewer.register(
+                            receiver,
+                            msg,
+                            max_lock_renewal_duration=max_lock_renewal_seconds,
+                        )
+                    except Exception as lock_error:
+                        logger.warning(f"Could not start Service Bus lock renewal: {lock_error}")
+
+                    result = await processor(email_message)
+                    await receiver.complete_message(msg)
+                    logger.info(f"Processed and completed message: {msg.sequence_number}")
+                    return result
+                except Exception:
+                    logger.exception(f"Processing failed; abandoning message: {msg.sequence_number}")
+                    try:
+                        await receiver.abandon_message(msg)
+                    except Exception as abandon_error:
+                        logger.warning(f"Could not abandon failed message {msg.sequence_number}: {abandon_error}")
+                    raise
+                finally:
+                    if lock_renewer is not None:
+                        await lock_renewer.__aexit__(None, None, None)
     
     def receive_email_from_intake(self, max_wait_seconds: int = 30) -> Optional[dict]:
         """
         Receive and complete a single email message from the intake queue.
+
+        Legacy helper retained for scripts/tests. Runtime processing should use
+        process_email_from_intake() so messages are completed only after the
+        agent finishes successfully.
         
         Args:
             max_wait_seconds: Maximum time to wait for a message

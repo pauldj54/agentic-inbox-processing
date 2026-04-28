@@ -444,12 +444,12 @@ class CosmosDBTools:
                 "emailId": email_id,
                 "attachmentName": attachment_name,
                 "extractedAt": datetime.utcnow().isoformat(),
+                "success": extracted_content.get("success", True),
+                "extractionError": extracted_content.get("error"),
                 "pageCount": extracted_content.get("page_count", 0),
                 "tableCount": extracted_content.get("table_count", 0),
-                "fullText": extracted_content.get("full_text", ""),
+                "content": extracted_content.get("content") or extracted_content.get("full_text", ""),
                 "tables": extracted_content.get("tables", []),
-                "keyValuePairs": extracted_content.get("key_value_pairs", []),
-                "summary": extracted_content.get("summary", {})
             }
             
             result = container.upsert_item(doc)
@@ -540,21 +540,34 @@ class CosmosDBTools:
         pe_company: str,
         fund_name: str,
         event_type: str,
-        amount: Optional[str] = None,
-        due_date: Optional[str] = None
+        amount: Optional[str] = None,  # kept for back-compat; no longer part of the key
+        due_date: Optional[str] = None,
+        investor: Optional[str] = None
     ) -> str:
         """
         Generate a deduplication key for PE events.
-        
-        The key is a hash of normalized key fields that uniquely identify an event.
-        
+
+        Minimum identifying fields: which fund called which investor on which
+        payment date, plus the event type as a guard against the (rare) case
+        of a same-day Distribution and Capital Call for the same fund/investor.
+
+        `pe_company` is intentionally NOT part of the key (it is derivable from
+        `fund_name`). `amount` is intentionally NOT part of the key (a restated
+        amount on the same notice should not create a phantom duplicate).
+
+        If `investor` is missing the key still hashes deterministically with an
+        empty slot — but a record without a grounded investor will already be
+        flagged `needs_attention` upstream, so it will not silently merge with a
+        Zava-default fallback as it used to.
+
         Args:
-            pe_company: PE firm name
+            pe_company: Ignored. Retained only for call-site back-compatibility.
             fund_name: Fund name
             event_type: Type of event (Capital Call, Distribution, etc.)
-            amount: Transaction amount (optional)
-            due_date: Due date (optional)
-            
+            amount: Ignored. Retained only for call-site back-compatibility.
+            due_date: Due date
+            investor: Investor / LP name
+
         Returns:
             SHA256 hash string (first 16 chars)
         """
@@ -562,46 +575,37 @@ class CosmosDBTools:
         def normalize(s: str) -> str:
             if not s:
                 return ""
-            # Lowercase, remove extra spaces, remove common suffixes
             s = s.lower().strip()
             s = " ".join(s.split())  # Normalize whitespace
-            # Remove common variations
             for suffix in [" llc", " lp", " inc", " corp", " ltd", " partners", " fund"]:
                 if s.endswith(suffix):
                     s = s[:-len(suffix)].strip()
             return s
-        
+
         # Extract month from due_date for fuzzy matching (same month = same event)
         date_key = ""
         if due_date:
             try:
-                # Handle various date formats
                 if "T" in due_date:
                     date_key = due_date[:7]  # YYYY-MM
                 elif "-" in due_date:
                     parts = due_date.split("-")
                     if len(parts) >= 2:
                         date_key = f"{parts[0]}-{parts[1]}"
-            except:
+            except Exception:
                 date_key = ""
-        
-        # Normalize amount (remove currency symbols, commas)
-        amount_key = ""
-        if amount:
-            amount_key = "".join(c for c in str(amount) if c.isdigit() or c == ".")
-        
-        # Build the composite key
+
+        # Minimum 4-field composite key.
         key_parts = [
-            normalize(pe_company),
-            normalize(fund_name),
             normalize(event_type),
-            amount_key,
-            date_key
+            normalize(fund_name),
+            normalize(investor),
+            date_key,
         ]
-        
+
         key_string = "|".join(key_parts)
         hash_value = hashlib.sha256(key_string.encode()).hexdigest()[:16]
-        
+
         logger.debug(f"Generated dedup key: {key_string} -> {hash_value}")
         return hash_value
 
@@ -625,20 +629,23 @@ class CosmosDBTools:
         Returns:
             Tuple of (pe_event document, is_duplicate boolean)
         """
-        pe_company = classification_details.get("pe_company", "Unknown")
-        fund_name = classification_details.get("fund_name", "Unknown")
-        event_type = classification_details.get("category", "Unknown")
+        pe_company = classification_details.get("pe_company") or "Unknown"
+        fund_name = classification_details.get("fund_name") or "Unknown"
+        event_type = classification_details.get("category") or "Unknown"
         amount = classification_details.get("amount")
         due_date = classification_details.get("due_date")
+        investor = classification_details.get("investor")  # may be None when not grounded
+        validation_errors = list(classification_details.get("validation_errors") or [])
         received_at = received_at or datetime.utcnow().isoformat()
-        
-        # Generate dedup key
+
+        # Generate dedup key (4-field minimum: event_type | fund_name | investor | due_date)
         dedup_key = self._generate_dedup_key(
             pe_company=pe_company,
             fund_name=fund_name,
             event_type=event_type,
             amount=amount,
-            due_date=due_date
+            due_date=due_date,
+            investor=investor,
         )
         
         logger.info(f"Looking for PE event with dedup key: {dedup_key}")
@@ -694,15 +701,33 @@ class CosmosDBTools:
                     "eventType": event_type,
                     "peCompany": pe_company,
                     "fundName": fund_name,
-                    "investor": "Zava Private Bank",
+                    "investor": investor,
                     "amount": amount,
                     "dueDate": due_date,
+                    "documentName": classification_details.get("document_name"),
+                    "contentHash": classification_details.get("content_hash"),
+                    "noticeDate": classification_details.get("notice_date"),
+                    "closingDate": classification_details.get("closing_date"),
+                    "valueDate": classification_details.get("value_date"),
+                    "currency": classification_details.get("currency"),
+                    "totalCommitment": classification_details.get("total_commitment"),
+                    "capitalCalledWithNotice": classification_details.get("capital_called_with_notice"),
+                    "fundLevelAmountCalled": classification_details.get("fund_level_amount_called"),
+                    "investorLevelAmountCalled": classification_details.get("investor_level_amount_called"),
+                    "totalAmountDue": classification_details.get("total_amount_due"),
+                    "shareClass": classification_details.get("share_class"),
+                    "reference": classification_details.get("reference"),
+                    "extractionMethod": classification_details.get("extraction_method"),
+                    "validationErrors": validation_errors,
                     "emailIds": [email_id],
                     "emailCount": 1,
                     "sourceRecords": [
                         {"id": email_id, "source": intake_source, "receivedAt": received_at}
                     ],
-                    "status": "pending",  # pending, archived, reviewed
+                    # If extraction couldn't ground critical fields, surface the
+                    # record for human review instead of presenting it as a clean
+                    # "pending" event in the dashboard.
+                    "status": "needs_attention" if validation_errors else "pending",
                     "createdAt": datetime.utcnow().isoformat(),
                     "lastEmailAt": datetime.utcnow().isoformat(),
                     "reasoning": classification_details.get("reasoning", ""),
@@ -768,6 +793,51 @@ class CosmosDBTools:
             else:
                 logger.warning(f"Email not found for duplicate marking: {email_id[:20]}...")
                 return None
+
+    def mark_processing_warning(
+        self,
+        email_id: str,
+        warning_type: str,
+        message: str,
+        details: Optional[dict] = None
+    ) -> dict | None:
+        """Mark an intake record as needing attention due to a processing warning."""
+        logger.warning(f"Marking intake record {email_id[:20]}... with warning: {warning_type}")
+
+        with self._get_sync_client() as client:
+            database = client.get_database_client(self.database_name)
+            container = database.get_container_client(self.CONTAINER_INTAKE_RECORDS)
+
+            query = "SELECT * FROM c WHERE c.id = @emailId OR c.emailId = @emailId"
+            items = list(container.query_items(
+                query=query,
+                parameters=[{"name": "@emailId", "value": email_id}],
+                enable_cross_partition_query=True
+            ))
+
+            if not items:
+                logger.warning(f"Intake record not found for processing warning: {email_id[:20]}...")
+                return None
+
+            doc = items[0]
+            warning = {
+                "type": warning_type,
+                "message": message,
+                "details": details or {},
+                "createdAt": datetime.utcnow().isoformat(),
+            }
+            if doc.get("status") != "needs_attention":
+                doc["previousStatus"] = doc.get("status")
+            doc["status"] = "needs_attention"
+            doc["processingWarning"] = warning
+            warnings = doc.get("processingWarnings", [])
+            warnings.append(warning)
+            doc["processingWarnings"] = warnings
+            doc["updatedAt"] = datetime.utcnow().isoformat()
+
+            result = container.upsert_item(doc)
+            logger.warning(f"Marked intake record as needs_attention: {email_id[:20]}...")
+            return result
 
     def get_pe_event_stats(self) -> dict:
         """

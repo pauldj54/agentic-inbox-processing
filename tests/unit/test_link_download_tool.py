@@ -18,6 +18,7 @@ Tests cover:
 """
 
 import asyncio
+import socket
 
 import aiohttp
 import pytest
@@ -794,3 +795,240 @@ class TestDownloadFailureFields:
         )
         assert f.error_type == "http_error"
         assert f.http_status == 500
+
+
+# =====================================================================
+# Direct HTTPS Fallback (IDNA bypass)
+# =====================================================================
+
+class TestDirectHttpsFallback:
+    """Tests for _download_with_urllib_fallback (direct HTTPS with IDNA bypass).
+
+    The fallback resolves the hostname to an IP using bytes (bypassing
+    Python's encodings.idna codec) and connects via raw socket + SSL SNI.
+    """
+
+    @pytest.fixture
+    def tool(self):
+        with patch.dict("os.environ", {"STORAGE_ACCOUNT_URL": "https://mock.blob.core.windows.net"}):
+            return LinkDownloadTool()
+
+    @pytest.mark.asyncio
+    async def test_idna_error_triggers_fallback(self, tool):
+        """When aiohttp raises an IDNA error, the fallback should be invoked."""
+        body = "File: https://stpauldj5463027136334086.blob.core.windows.net/test-downloads/report.pdf"
+
+        # On Azure App Service, IDNA errors surface as UnicodeError from yarl
+        idna_exc = UnicodeError("encoding with 'idna' codec failed (UnicodeError: label empty or too long)")
+
+        @asynccontextmanager
+        async def fake_get(url):
+            raise idna_exc
+            yield  # pragma: no cover
+
+        mock_session = MagicMock()
+        mock_session.get = fake_get
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock()
+
+        mock_blob_service = MagicMock()
+        mock_blob_service.__aenter__ = AsyncMock(return_value=mock_blob_service)
+        mock_blob_service.__aexit__ = AsyncMock()
+
+        fallback_called = False
+        original_fallback = tool._download_with_urllib_fallback
+
+        async def tracked_fallback(*args, **kwargs):
+            nonlocal fallback_called
+            fallback_called = True
+            return await original_fallback(*args, **kwargs)
+
+        with patch("src.agents.tools.link_download_tool.DefaultAzureCredential") as MockCred, \
+             patch("src.agents.tools.link_download_tool.BlobServiceClient", return_value=mock_blob_service), \
+             patch("src.agents.tools.link_download_tool.aiohttp.ClientSession", return_value=mock_session), \
+             patch.object(tool, "_download_with_urllib_fallback", side_effect=tracked_fallback):
+            MockCred.return_value = AsyncMock()
+            await tool.process_email_links("email-idna", body)
+
+        assert fallback_called, "IDNA error should trigger fallback"
+
+    @pytest.mark.asyncio
+    async def test_fallback_dns_resolution_uses_bytes(self, tool):
+        """Fallback should resolve hostname using bytes to bypass IDNA codec."""
+        import socket as _socket
+
+        url = "https://stpauldj5463027136334086.blob.core.windows.net/test-downloads/report.pdf"
+        result = LinkDownloadResult()
+        result.urls_attempted = 1
+
+        # Track getaddrinfo calls
+        original_getaddrinfo = _socket.getaddrinfo
+        getaddrinfo_args = []
+
+        def mock_getaddrinfo(host, *args, **kwargs):
+            getaddrinfo_args.append(host)
+            # Return a valid result for the bytes hostname
+            return [(_socket.AF_INET, _socket.SOCK_STREAM, 0, "", ("20.60.234.4", 443))]
+
+        mock_blob_service = MagicMock()
+        mock_blob_service.__aenter__ = AsyncMock(return_value=mock_blob_service)
+        mock_blob_service.__aexit__ = AsyncMock()
+
+        # Mock the downstream socket/SSL/HTTP calls
+        mock_ssl_sock = MagicMock()
+        mock_conn_response = MagicMock()
+        mock_conn_response.status = 200
+        mock_conn_response.getheader = lambda h, d=None: "application/pdf" if h == "Content-Type" else d
+        mock_conn_response.read = lambda: b"%PDF-1.4 fake content"
+
+        with patch("src.agents.tools.link_download_tool.socket.getaddrinfo", side_effect=mock_getaddrinfo), \
+             patch("src.agents.tools.link_download_tool.socket.create_connection", return_value=MagicMock()), \
+             patch("src.agents.tools.link_download_tool.ssl.create_default_context") as mock_ssl_ctx, \
+             patch("src.agents.tools.link_download_tool.http.client.HTTPSConnection") as MockConn:
+            mock_ssl_ctx.return_value.wrap_socket.return_value = mock_ssl_sock
+            mock_http_conn = MagicMock()
+            mock_http_conn.getresponse.return_value = mock_conn_response
+            MockConn.return_value = mock_http_conn
+
+            # Mock blob upload
+            mock_container = MagicMock()
+            mock_blob_client = MagicMock()
+            mock_blob_client.upload_blob = AsyncMock()
+            mock_container.get_blob_client.return_value = mock_blob_client
+            mock_blob_service.get_container_client.return_value = mock_container
+
+            downloaded = await tool._download_with_urllib_fallback(
+                mock_blob_service, "email-test", url, result,
+            )
+
+        # Verify DNS resolution was called with bytes (IDNA bypass)
+        assert len(getaddrinfo_args) > 0, "getaddrinfo should have been called"
+        assert isinstance(getaddrinfo_args[0], bytes), (
+            f"hostname should be bytes to bypass IDNA, got {type(getaddrinfo_args[0])}"
+        )
+        assert getaddrinfo_args[0] == b"stpauldj5463027136334086.blob.core.windows.net"
+
+        # Verify download succeeded
+        assert downloaded is not None
+        assert downloaded.source == "link"
+        assert downloaded.content_type == "application/pdf"
+        assert "report.pdf" in downloaded.path
+
+    @pytest.mark.asyncio
+    async def test_fallback_rejects_non_allowed_content_type(self, tool):
+        """Fallback should reject content types not in the allowed list."""
+        url = "https://stpauldj5463027136334086.blob.core.windows.net/test-downloads/data.csv"
+        result = LinkDownloadResult()
+
+        mock_blob_service = MagicMock()
+        mock_conn_response = MagicMock()
+        mock_conn_response.status = 200
+        mock_conn_response.getheader = lambda h, d=None: "text/csv" if h == "Content-Type" else d
+
+        with patch("src.agents.tools.link_download_tool.socket.getaddrinfo",
+                    return_value=[(2, 1, 0, "", ("20.60.234.4", 443))]), \
+             patch("src.agents.tools.link_download_tool.socket.create_connection", return_value=MagicMock()), \
+             patch("src.agents.tools.link_download_tool.ssl.create_default_context") as mock_ssl_ctx, \
+             patch("src.agents.tools.link_download_tool.http.client.HTTPSConnection") as MockConn:
+            mock_ssl_ctx.return_value.wrap_socket.return_value = MagicMock()
+            mock_http_conn = MagicMock()
+            mock_http_conn.getresponse.return_value = mock_conn_response
+            MockConn.return_value = mock_http_conn
+
+            downloaded = await tool._download_with_urllib_fallback(
+                mock_blob_service, "email-csv", url, result,
+            )
+
+        assert downloaded is None
+        assert len(result.failures) == 1
+        assert result.failures[0].error_type == "content_type_not_allowed"
+
+    @pytest.mark.asyncio
+    async def test_fallback_handles_http_error(self, tool):
+        """Fallback returns failure for non-200 status codes."""
+        url = "https://stpauldj5463027136334086.blob.core.windows.net/test-downloads/missing.pdf"
+        result = LinkDownloadResult()
+
+        mock_blob_service = MagicMock()
+        mock_conn_response = MagicMock()
+        mock_conn_response.status = 404
+
+        with patch("src.agents.tools.link_download_tool.socket.getaddrinfo",
+                    return_value=[(2, 1, 0, "", ("20.60.234.4", 443))]), \
+             patch("src.agents.tools.link_download_tool.socket.create_connection", return_value=MagicMock()), \
+             patch("src.agents.tools.link_download_tool.ssl.create_default_context") as mock_ssl_ctx, \
+             patch("src.agents.tools.link_download_tool.http.client.HTTPSConnection") as MockConn:
+            mock_ssl_ctx.return_value.wrap_socket.return_value = MagicMock()
+            mock_http_conn = MagicMock()
+            mock_http_conn.getresponse.return_value = mock_conn_response
+            MockConn.return_value = mock_http_conn
+
+            downloaded = await tool._download_with_urllib_fallback(
+                mock_blob_service, "email-404", url, result,
+            )
+
+        assert downloaded is None
+        assert len(result.failures) == 1
+        assert result.failures[0].error_type == "http_error"
+        assert "404" in result.failures[0].error
+
+    @pytest.mark.asyncio
+    async def test_fallback_handles_dns_failure(self, tool):
+        """Fallback should record failure if DNS resolution fails."""
+        url = "https://nonexistent-host-12345.example.com/test.pdf"
+        result = LinkDownloadResult()
+
+        mock_blob_service = MagicMock()
+
+        with patch("src.agents.tools.link_download_tool.socket.getaddrinfo",
+                    side_effect=socket.gaierror("Name or service not known")):
+            downloaded = await tool._download_with_urllib_fallback(
+                mock_blob_service, "email-dns", url, result,
+            )
+
+        assert downloaded is None
+        assert len(result.failures) == 1
+        assert "direct HTTPS fallback failed" in result.failures[0].error
+
+    @pytest.mark.asyncio
+    async def test_fallback_successful_pdf_download(self, tool):
+        """Fallback should download, upload to blob, and return DownloadedFile."""
+        url = "https://stpauldj5463027136334086.blob.core.windows.net/test-downloads/Capital_Call.pdf"
+        result = LinkDownloadResult()
+        pdf_data = b"%PDF-1.4 test content for capital call"
+
+        mock_blob_service = MagicMock()
+        mock_container = MagicMock()
+        mock_blob_client = MagicMock()
+        mock_blob_client.upload_blob = AsyncMock()
+        mock_container.get_blob_client.return_value = mock_blob_client
+        mock_blob_service.get_container_client.return_value = mock_container
+
+        mock_conn_response = MagicMock()
+        mock_conn_response.status = 200
+        mock_conn_response.getheader = lambda h, d=None: "application/pdf" if h == "Content-Type" else d
+        mock_conn_response.read = lambda: pdf_data
+
+        with patch("src.agents.tools.link_download_tool.socket.getaddrinfo",
+                    return_value=[(2, 1, 0, "", ("20.60.234.4", 443))]), \
+             patch("src.agents.tools.link_download_tool.socket.create_connection", return_value=MagicMock()), \
+             patch("src.agents.tools.link_download_tool.ssl.create_default_context") as mock_ssl_ctx, \
+             patch("src.agents.tools.link_download_tool.http.client.HTTPSConnection") as MockConn:
+            mock_ssl_ctx.return_value.wrap_socket.return_value = MagicMock()
+            mock_http_conn = MagicMock()
+            mock_http_conn.getresponse.return_value = mock_conn_response
+            MockConn.return_value = mock_http_conn
+
+            downloaded = await tool._download_with_urllib_fallback(
+                mock_blob_service, "email-success", url, result,
+            )
+
+        assert downloaded is not None
+        assert downloaded.source == "link"
+        assert downloaded.content_type == "application/pdf"
+        assert "Capital_Call.pdf" in downloaded.path
+        assert downloaded.content_md5 is not None
+        assert len(result.failures) == 0
+
+        # Verify blob upload was called
+        mock_blob_client.upload_blob.assert_called_once()

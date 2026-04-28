@@ -47,7 +47,7 @@
           "uri": "https://graph.microsoft.com/v1.0/users/@{parameters('monitoredMailbox')}/messages",
           "queries": {
             "$filter": "isRead eq false",
-            "$top": "10",
+            "$top": "25",
             "$expand": "attachments",
             "$select": "id,from,subject,body,bodyPreview,receivedDateTime,hasAttachments",
             "$orderby": "receivedDateTime asc"
@@ -61,7 +61,7 @@
             "secret": "@parameters('graphClientSecret')"
           }
         },
-        "description": "Fetches up to 10 unread emails from the monitored mailbox using Microsoft Graph API with app-only (client credentials) authentication."
+        "description": "Fetches unread emails from the monitored mailbox via Graph API. Processed emails are marked as read, and a Cosmos pre-check skips already-processed emails while their records exist."
       },
       "For_each_message": {
         "foreach": "@body('HTTP_Get_Unread_Messages')?['value']",
@@ -110,6 +110,48 @@
               "value": []
             }
           },
+          "Check_already_processed": {
+            "runAfter": {
+              "Reset_RejectedAttachments": [
+                "Succeeded"
+              ]
+            },
+            "type": "ApiConnection",
+            "inputs": {
+              "host": {
+                "connection": {
+                  "name": "@parameters('$connections')['documentdb']['connectionId']"
+                }
+              },
+              "method": "get",
+              "path": "/v5/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('intake-records')}/query",
+              "queries": {
+                "queryText": "SELECT c.id FROM c WHERE c.id = '@{items('For_each_message')?['id']}'",
+                "partitionKey": "\"@{concat(replace(last(split(items('For_each_message')?['from']?['emailAddress']?['address'], '@')), '>', ''), '_', formatDateTime(items('For_each_message')?['receivedDateTime'], 'yyyy-MM'))}\"",
+                "maxItemCount": 1
+              }
+            },
+            "description": "Pre-check: query Cosmos by message ID to skip already-processed emails."
+          },
+          "If_not_already_processed": {
+            "runAfter": {
+              "Check_already_processed": [
+                "Succeeded"
+              ]
+            },
+            "type": "If",
+            "expression": {
+              "and": [
+                {
+                  "equals": [
+                    "@length(body('Check_already_processed')?['value'])",
+                    0
+                  ]
+                }
+              ]
+            },
+            "description": "Only process emails not yet in Cosmos DB. Already-processed emails are skipped efficiently.",
+            "actions": {
           "For_each_attachment": {
             "foreach": "@items('For_each_message')?['attachments']",
             "actions": {
@@ -245,11 +287,7 @@
                 "type": "If"
               }
             },
-            "runAfter": {
-              "Reset_RejectedAttachments": [
-                "Succeeded"
-              ]
-            },
+            "runAfter": {},
             "type": "Foreach",
             "runtimeConfiguration": {
               "concurrency": {
@@ -286,7 +324,7 @@
               "method": "get",
               "path": "/v5/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('intake-records')}/query",
               "queries": {
-                "queryText": "SELECT TOP 1 * FROM c WHERE c.contentHash = '@{coalesce(outputs('Compute_primary_hash'), '__NO_HASH__')}'",
+                "queryText": "SELECT TOP 1 * FROM c WHERE c.contentHash = '@{coalesce(outputs('Compute_primary_hash'), '__NO_HASH__')}' AND c.primaryAttachmentName = '@{outputs('Compute_primary_attachment_name')}'",
                 "partitionKey": "\"@{concat(replace(last(split(items('For_each_message')?['from']?['emailAddress']?['address'], '@')), '>', ''), '_', formatDateTime(items('For_each_message')?['receivedDateTime'], 'yyyy-MM'))}\"",
                 "maxItemCount": 1
               }
@@ -311,7 +349,13 @@
               ]
             },
             "actions": {
-              "Patch_email_delivery_count": {
+              "Compose_duplicate_update": {
+                "type": "Compose",
+                "inputs": "@setProperty(setProperty(setProperty(first(body('Check_content_hash_dedup')?['value']), 'deliveryCount', add(coalesce(first(body('Check_content_hash_dedup')?['value'])?['deliveryCount'], 0), 1)), 'lastDeliveredAt', utcNow()), 'deliveryHistory', union(coalesce(first(body('Check_content_hash_dedup')?['value'])?['deliveryHistory'], createArray()), createArray(json(concat('{\"deliveredAt\":\"', utcNow(), '\",\"contentHash\":\"', outputs('Compute_primary_hash'), '\",\"action\":\"duplicate\"}')))))",
+                "runAfter": {},
+                "description": "Build the updated document with incremented deliveryCount and appended delivery history."
+              },
+              "Upsert_duplicate_record": {
                 "type": "ApiConnection",
                 "inputs": {
                   "host": {
@@ -319,38 +363,47 @@
                       "name": "@parameters('$connections')['documentdb']['connectionId']"
                     }
                   },
-                  "method": "patch",
-                  "path": "/v2/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('intake-records')}/docs/@{encodeURIComponent(first(body('Check_content_hash_dedup')?['value'])?['id'])}",
+                  "method": "post",
+                  "body": "@outputs('Compose_duplicate_update')",
                   "headers": {
-                    "Content-Type": "application/json_patch+json",
-                    "x-ms-documentdb-partitionkey": "[\"@{first(body('Check_content_hash_dedup')?['value'])?['partitionKey']}\"]",
-                    "x-ms-version": "2022-11-15"
+                    "x-ms-documentdb-is-upsert": true
                   },
-                  "body": {
-                    "operations": [
-                      {
-                        "op": "incr",
-                        "path": "/deliveryCount",
-                        "value": 1
-                      },
-                      {
-                        "op": "add",
-                        "path": "/deliveryHistory/-",
-                        "value": {
-                          "deliveredAt": "@{utcNow()}",
-                          "contentHash": "@{outputs('Compute_primary_hash')}",
-                          "action": "duplicate"
-                        }
-                      },
-                      {
-                        "op": "set",
-                        "path": "/lastDeliveredAt",
-                        "value": "@{utcNow()}"
-                      }
-                    ]
-                  }
+                  "path": "/v2/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('intake-records')}/docs"
                 },
-                "description": "Duplicate: increment deliveryCount, append delivery history on existing record via Cosmos DB partial update."
+                "runAfter": {
+                  "Compose_duplicate_update": [
+                    "Succeeded"
+                  ]
+                },
+                "description": "Duplicate: upsert record with incremented deliveryCount (avoids PATCH URL encoding issue with Outlook message IDs)."
+              },
+              "Create_dedup_marker": {
+                "runAfter": {
+                  "Upsert_duplicate_record": [
+                    "Succeeded"
+                  ]
+                },
+                "type": "ApiConnection",
+                "inputs": {
+                  "host": {
+                    "connection": {
+                      "name": "@parameters('$connections')['documentdb']['connectionId']"
+                    }
+                  },
+                  "method": "post",
+                  "body": {
+                    "id": "@{items('For_each_message')?['id']}",
+                    "partitionKey": "@{concat(replace(last(split(items('For_each_message')?['from']?['emailAddress']?['address'], '@')), '>', ''), '_', formatDateTime(items('For_each_message')?['receivedDateTime'], 'yyyy-MM'))}",
+                    "type": "processed-marker",
+                    "markerReason": "hash-duplicate",
+                    "processedAt": "@{utcNow()}"
+                  },
+                  "headers": {
+                    "x-ms-documentdb-is-upsert": true
+                  },
+                  "path": "/v2/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('intake-records')}/docs"
+                },
+                "description": "Marker record: stores the new message ID so Check_already_processed skips this email on subsequent polls within the time window."
               }
             },
             "else": {
@@ -391,7 +444,13 @@
                     ]
                   },
                   "actions": {
-                    "Patch_email_content_update": {
+                    "Compose_content_update": {
+                      "type": "Compose",
+                      "inputs": "@setProperty(setProperty(setProperty(setProperty(setProperty(first(body('Check_filename_match')?['value']), 'contentHash', outputs('Compute_primary_hash')), 'version', add(coalesce(first(body('Check_filename_match')?['value'])?['version'], 0), 1)), 'deliveryCount', add(coalesce(first(body('Check_filename_match')?['value'])?['deliveryCount'], 0), 1)), 'lastDeliveredAt', utcNow()), 'deliveryHistory', union(coalesce(first(body('Check_filename_match')?['value'])?['deliveryHistory'], createArray()), createArray(json(concat('{\"deliveredAt\":\"', utcNow(), '\",\"contentHash\":\"', outputs('Compute_primary_hash'), '\",\"action\":\"update\"}')))))",
+                      "runAfter": {},
+                      "description": "Build updated document with new contentHash, incremented version/deliveryCount, and appended delivery history."
+                    },
+                    "Upsert_content_update": {
                       "type": "ApiConnection",
                       "inputs": {
                         "host": {
@@ -399,48 +458,47 @@
                             "name": "@parameters('$connections')['documentdb']['connectionId']"
                           }
                         },
-                        "method": "patch",
-                        "path": "/v2/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('intake-records')}/docs/@{encodeURIComponent(first(body('Check_filename_match')?['value'])?['id'])}",
+                        "method": "post",
+                        "body": "@outputs('Compose_content_update')",
                         "headers": {
-                          "Content-Type": "application/json_patch+json",
-                          "x-ms-documentdb-partitionkey": "[\"@{first(body('Check_filename_match')?['value'])?['partitionKey']}\"]",
-                          "x-ms-version": "2022-11-15"
+                          "x-ms-documentdb-is-upsert": true
                         },
-                        "body": {
-                          "operations": [
-                            {
-                              "op": "set",
-                              "path": "/contentHash",
-                              "value": "@{outputs('Compute_primary_hash')}"
-                            },
-                            {
-                              "op": "incr",
-                              "path": "/version",
-                              "value": 1
-                            },
-                            {
-                              "op": "incr",
-                              "path": "/deliveryCount",
-                              "value": 1
-                            },
-                            {
-                              "op": "add",
-                              "path": "/deliveryHistory/-",
-                              "value": {
-                                "deliveredAt": "@{utcNow()}",
-                                "contentHash": "@{outputs('Compute_primary_hash')}",
-                                "action": "update"
-                              }
-                            },
-                            {
-                              "op": "set",
-                              "path": "/lastDeliveredAt",
-                              "value": "@{utcNow()}"
-                            }
-                          ]
-                        }
+                        "path": "/v2/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('intake-records')}/docs"
                       },
-                      "description": "US4 content update: same filename, different hash \u2014 increment version, update contentHash, append delivery history."
+                      "runAfter": {
+                        "Compose_content_update": [
+                          "Succeeded"
+                        ]
+                      },
+                      "description": "US4 content update: upsert record with new contentHash and incremented version (avoids PATCH URL encoding issue with Outlook message IDs)."
+                    },
+                    "Create_update_marker": {
+                      "runAfter": {
+                        "Upsert_content_update": [
+                          "Succeeded"
+                        ]
+                      },
+                      "type": "ApiConnection",
+                      "inputs": {
+                        "host": {
+                          "connection": {
+                            "name": "@parameters('$connections')['documentdb']['connectionId']"
+                          }
+                        },
+                        "method": "post",
+                        "body": {
+                          "id": "@{items('For_each_message')?['id']}",
+                          "partitionKey": "@{concat(replace(last(split(items('For_each_message')?['from']?['emailAddress']?['address'], '@')), '>', ''), '_', formatDateTime(items('For_each_message')?['receivedDateTime'], 'yyyy-MM'))}",
+                          "type": "processed-marker",
+                          "markerReason": "filename-update",
+                          "processedAt": "@{utcNow()}"
+                        },
+                        "headers": {
+                          "x-ms-documentdb-is-upsert": true
+                        },
+                        "path": "/v2/cosmosdb/@{encodeURIComponent('cosmos-docproc-dev-izr2ch55woa3c')}/dbs/@{encodeURIComponent('email-processing')}/colls/@{encodeURIComponent('intake-records')}/docs"
+                      },
+                      "description": "Marker record: stores the new message ID so Check_already_processed skips this email on subsequent polls within the time window."
                     }
                   },
                   "else": {
@@ -586,7 +644,7 @@
                 "secret": "@parameters('graphClientSecret')"
               }
             },
-            "description": "Marks the email as read to prevent reprocessing on next poll."
+            "description": "Marks the email as read for mailbox hygiene. The Cosmos pre-check (Check_already_processed) is the primary mechanism preventing re-processing."
           },
           "Compute_primary_attachment_name": {
             "runAfter": {
@@ -597,6 +655,11 @@
             "type": "Compose",
             "inputs": "@if(greater(length(variables('AttachmentPaths')), 0), first(variables('AttachmentPaths'))['originalName'], null)",
             "description": "Extract primary attachment filename for filename-match dedup in US4."
+          }
+            },
+            "else": {
+              "actions": {}
+            }
           }
         }
       }
